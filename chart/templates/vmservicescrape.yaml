@@ -1,0 +1,18 @@
+{{- if .Values.vmServiceScrape.enabled }}
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: {{ include "ssu-catalog.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ssu-catalog.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "ssu-catalog.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 60s
+      scrapeTimeout: 120s
+{{- end }}
