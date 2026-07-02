@@ -235,47 +235,65 @@ func (p *Prober) addHits(n int) {
 	}
 }
 
-// annotateExternalAvailability marks each doc externally available when its path
-// is covered by a Traefik IngressRoute on an external host, filling ExternalURL
-// with the reachable https URL (external host + the doc's own path). The scheme is
-// always https, mirroring the portal's serviceUrlsFor derivation of external URLs.
+// annotateExternalAvailability marks each doc externally available when a Traefik
+// IngressRoute on an external host exposes this service, filling ExternalURL with
+// the reachable https URL. DFDS services are typically mounted under a path prefix
+// with a StripPrefix middleware, so the external path is the route's mount prefix
+// joined with the doc's own in-cluster path — e.g. a doc probed at /swagger behind
+// a route on host api.example.com PathPrefix(`/dev/addon`) is reachable at
+// https://api.example.com/dev/addon/swagger. The scheme is always https, mirroring
+// the portal's serviceUrlsFor derivation of external URLs.
 func annotateExternalAvailability(routes []model.RouteRef, docs []model.APIDocInfo) {
 	for i := range docs {
-		if host, ok := externalHostForPath(routes, docs[i].Path); ok {
+		if url, ok := externalURLForPath(routes, docs[i].Path); ok {
 			docs[i].ExternallyAvailable = true
-			docs[i].ExternalURL = "https://" + host + docs[i].Path
+			docs[i].ExternalURL = url
 		}
 	}
 }
 
-// externalHostForPath returns the first external host whose IngressRoute covers
-// the path. A route covers it when it has at least one Host matcher and either no
-// PathPrefix (whole-host route) or a prefix the path falls under.
-func externalHostForPath(routes []model.RouteRef, path string) (string, bool) {
+// externalURLForPath returns the reachable https URL for a doc at the given
+// in-cluster path, and whether any external host exposes it. Every route in the
+// list already forwards to this service, so any host-bearing route makes the
+// service externally reachable. Among all (host, prefix) mount points, the one
+// producing the shortest external path wins — this prefers a service's base mount
+// (e.g. /dev/addon) over a more specific sub-route (e.g. /dev/addon/metrics).
+func externalURLForPath(routes []model.RouteRef, path string) (string, bool) {
+	bestHost, bestPath := "", ""
 	for _, r := range routes {
 		if len(r.Hosts) == 0 {
 			continue
 		}
-		if pathCoveredByPrefixes(r.PathPrefixes, path) {
-			return r.Hosts[0], true
+		prefixes := r.PathPrefixes
+		if len(prefixes) == 0 {
+			prefixes = []string{""} // whole-host route mounts the service at root
+		}
+		for _, p := range prefixes {
+			ext := externalPathForMount(p, path)
+			if bestHost == "" || len(ext) < len(bestPath) {
+				bestHost, bestPath = r.Hosts[0], ext
+			}
 		}
 	}
-	return "", false
+	if bestHost == "" {
+		return "", false
+	}
+	return "https://" + bestHost + bestPath, true
 }
 
-// pathCoveredByPrefixes reports whether path falls under any of the route's path
-// prefixes. An empty prefix set means the route serves every path on its host.
-func pathCoveredByPrefixes(prefixes []string, path string) bool {
-	if len(prefixes) == 0 {
-		return true // host-only route serves every path
+// externalPathForMount computes the external request path that reaches a doc at
+// in-cluster path docPath through a route whose PathPrefix is `prefix`. When the
+// doc path already falls under the prefix the route serves it directly (no strip);
+// otherwise the prefix is a StripPrefix mount point and is prepended.
+func externalPathForMount(prefix, docPath string) string {
+	p := "/" + strings.Trim(prefix, "/")
+	if p == "/" { // empty / "/" — whole-host mount
+		return docPath
 	}
-	for _, p := range prefixes {
-		if p == "" || p == "/" || path == p ||
-			strings.HasPrefix(path, strings.TrimRight(p, "/")+"/") {
-			return true
-		}
+	if docPath == p || strings.HasPrefix(docPath, p+"/") {
+		return docPath // already served under this prefix
 	}
-	return false
+	return p + docPath
 }
 
 // sortDocs gives APIDocs a stable order (port, then path).

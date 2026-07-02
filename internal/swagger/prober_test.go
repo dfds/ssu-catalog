@@ -193,26 +193,25 @@ func TestProbe_DeduplicatesPorts(t *testing.T) {
 	}
 }
 
-func TestPathCoveredByPrefixes(t *testing.T) {
+func TestExternalPathForMount(t *testing.T) {
 	cases := []struct {
-		name     string
-		prefixes []string
-		path     string
-		want     bool
+		name    string
+		prefix  string
+		docPath string
+		want    string
 	}{
-		{"no prefixes serves every path", nil, "/swagger/v1/swagger.json", true},
-		{"root prefix covers all", []string{"/"}, "/swagger", true},
-		{"exact match", []string{"/openapi.json"}, "/openapi.json", true},
-		{"prefix covers subpath", []string{"/api"}, "/api/swagger", true},
-		{"prefix with trailing slash", []string{"/api/"}, "/api/swagger", true},
-		{"prefix is not a segment boundary", []string{"/api"}, "/apidocs", false},
-		{"unrelated prefix", []string{"/admin"}, "/swagger", false},
-		{"one of several matches", []string{"/admin", "/swagger"}, "/swagger/v1/swagger.json", true},
+		{"whole-host mount serves doc path as-is", "", "/swagger", "/swagger"},
+		{"root prefix serves doc path as-is", "/", "/swagger", "/swagger"},
+		{"strip-prefix mount prepends the prefix", "/dev/addon", "/swagger", "/dev/addon/swagger"},
+		{"trailing slash on prefix is normalised", "/dev/addon/", "/swagger", "/dev/addon/swagger"},
+		{"doc already under prefix is served directly", "/swagger", "/swagger/v1/swagger.json", "/swagger/v1/swagger.json"},
+		{"exact prefix equals doc path", "/openapi.json", "/openapi.json", "/openapi.json"},
+		{"non-boundary overlap is treated as a mount", "/api", "/apidocs", "/api/apidocs"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := pathCoveredByPrefixes(tc.prefixes, tc.path); got != tc.want {
-				t.Errorf("pathCoveredByPrefixes(%v, %q) = %v, want %v", tc.prefixes, tc.path, got, tc.want)
+			if got := externalPathForMount(tc.prefix, tc.docPath); got != tc.want {
+				t.Errorf("externalPathForMount(%q, %q) = %q, want %q", tc.prefix, tc.docPath, got, tc.want)
 			}
 		})
 	}
@@ -228,7 +227,7 @@ func TestAnnotateExternalAvailability(t *testing.T) {
 		}
 	})
 
-	t.Run("covering route yields https external url on the doc path", func(t *testing.T) {
+	t.Run("doc already under the route prefix is served directly", func(t *testing.T) {
 		routes := []model.RouteRef{{
 			Name:         "api",
 			Hosts:        []string{"api.example.com"},
@@ -245,12 +244,23 @@ func TestAnnotateExternalAvailability(t *testing.T) {
 		}
 	})
 
-	t.Run("route on a different prefix leaves doc internal-only", func(t *testing.T) {
-		routes := []model.RouteRef{{Name: "app", Hosts: []string{"app.example.com"}, PathPrefixes: []string{"/app"}}}
-		docs := []model.APIDocInfo{{Path: "/swagger"}}
+	t.Run("service mounted under a path prefix prepends it to the doc path", func(t *testing.T) {
+		// Mirrors the real DFDS pattern: the service is mounted at /dev/addon
+		// (StripPrefix), so an in-cluster doc at /swagger is externally reachable
+		// at /dev/addon/swagger. A more specific /dev/addon/metrics sub-route must
+		// not win — the base mount produces the shorter external path.
+		routes := []model.RouteRef{
+			{Name: "base", Hosts: []string{"api.example.com"}, PathPrefixes: []string{"/dev/addon"}, TLS: true},
+			{Name: "metrics", Hosts: []string{"api.example.com"}, PathPrefixes: []string{"/dev/addon/metrics"}, TLS: true},
+			{Name: "internal-metrics", Hosts: []string{"internal.example.com"}, PathPrefixes: []string{"/dev/addon/metrics"}, TLS: true},
+		}
+		docs := []model.APIDocInfo{{Path: "/swagger"}, {Path: "/swagger/index.html"}}
 		annotateExternalAvailability(routes, docs)
-		if docs[0].ExternallyAvailable {
-			t.Errorf("expected internal-only, got %+v", docs[0])
+		if !docs[0].ExternallyAvailable || docs[0].ExternalURL != "https://api.example.com/dev/addon/swagger" {
+			t.Errorf("doc[0] wrong: %+v", docs[0])
+		}
+		if !docs[1].ExternallyAvailable || docs[1].ExternalURL != "https://api.example.com/dev/addon/swagger/index.html" {
+			t.Errorf("doc[1] wrong: %+v", docs[1])
 		}
 	})
 }
