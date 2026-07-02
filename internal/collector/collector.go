@@ -88,7 +88,12 @@ func (c *Collector) Collect(ctx context.Context) (*model.Catalog, error) {
 		Applications: applications,
 		Namespaces:   namespaces,
 		Dependencies: dependencies,
-		CollectedAt:  started,
+		// CollectedAt = scan start (data is observed "as of" here); PublishedAt = when
+		// the assembled snapshot became current. A full collection takes minutes, so
+		// consumers wanting a "last updated" age should prefer PublishedAt — it doesn't
+		// read staler by the collection duration the way the start time does.
+		CollectedAt: started,
+		PublishedAt: time.Now(),
 	}
 	catalog.Stats = computeStats(catalog, time.Since(started))
 

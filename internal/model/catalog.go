@@ -8,7 +8,8 @@ type Catalog struct {
 	Applications []ApplicationEntry `json:"applications"` // primary, portal-facing entity
 	Namespaces   []NamespaceEntry   `json:"namespaces"`
 	Dependencies []DependencyEdge   `json:"dependencies"` // best-effort telemetry/NetworkPolicy overlay
-	CollectedAt  time.Time          `json:"collectedAt"`
+	CollectedAt  time.Time          `json:"collectedAt"`  // scan start — data is observed "as of" here
+	PublishedAt  time.Time          `json:"publishedAt"`  // snapshot assembled — use for "last updated" age
 	Stats        CatalogStats       `json:"stats"`
 }
 

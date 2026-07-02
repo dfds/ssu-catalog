@@ -28,7 +28,7 @@ func (h *Catalog) snapshot() *model.Catalog {
 }
 
 func (h *Catalog) meta(cat *model.Catalog) gin.H {
-	return gin.H{"collectedAt": cat.CollectedAt, "cluster": cat.Cluster}
+	return gin.H{"collectedAt": cat.CollectedAt, "publishedAt": cat.PublishedAt, "cluster": cat.Cluster}
 }
 
 func (h *Catalog) respond(c *gin.Context, cat *model.Catalog, data any) {
