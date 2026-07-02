@@ -1,0 +1,64 @@
+replicaCount: 1
+
+image:
+  repository: dfdsdk/ssu-catalog
+  pullPolicy: Always
+  tag: "latest"
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Cluster-scoped RBAC (ClusterRole + ClusterRoleBinding) granting the
+# ServiceAccount cluster-wide read access for the catalog scan. Set to false when
+# these are managed out-of-band (e.g. applied by a cluster admin because the Argo
+# AppProject blacklists cluster-scoped resources).
+rbac:
+  create: true
+
+service:
+  type: ClusterIP
+  port: 8080
+  metricsPort: 9090
+
+ingress:
+  enabled: true
+  host: ""          # e.g. ssu-catalog.hellman.oxygen.dfds.cloud
+  entryPoints: []   # e.g. [websecure]
+
+serviceMonitor:
+  enabled: true
+
+vmServiceScrape:
+  enabled: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Plain (non-secret) configuration. Secrets (e.g. SSUC_TELEMETRY_BASICAUTHTOKEN)
+# come from envFromSecret.
+env:
+  SSUC_CLUSTERNAME: ""
+  SSUC_WORKERINTERVAL: "300"
+  SSUC_KUBERNETES_QPS: "50"     # client-go client-side rate limiter QPS
+  SSUC_KUBERNETES_BURST: "100"  # client-go client-side rate limiter burst
+  SSUC_OIDC_ENABLED: "true"
+  SSUC_OIDC_ISSUERURL: ""
+  SSUC_OIDC_AUDIENCE: ""
+  SSUC_GITOPS_ENABLED: "true"
+  SSUC_SWAGGER_ENABLED: "true"
+  SSUC_TELEMETRY_ENABLED: "false"
+  SSUC_TELEMETRY_MIMIRURL: ""        # e.g. https://<stack>.grafana.net/api/prom
+  SSUC_TELEMETRY_BASICAUTHUSER: ""   # Grafana Cloud user/instance ID (token via envFromSecret)
+  SSUC_TELEMETRY_LOOKBACKMINUTES: "60"
+
+envFromSecret: ""   # name of a Secret carrying SSUC_TELEMETRY_BASICAUTHTOKEN etc.

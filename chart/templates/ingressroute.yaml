@@ -1,0 +1,22 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ include "ssu-catalog.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ssu-catalog.labels" . | nindent 4 }}
+spec:
+  {{- with .Values.ingress.entryPoints }}
+  entryPoints:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  routes:
+    - kind: Rule
+      match: Host(`{{ required "ingress.host is required when ingress.enabled" .Values.ingress.host }}`) && PathPrefix(`/api/v1`)
+      services:
+        - kind: Service
+          name: {{ include "ssu-catalog.fullname" . }}
+          namespace: {{ .Release.Namespace }}
+          port: {{ .Values.service.port }}
+{{- end }}
