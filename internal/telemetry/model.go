@@ -90,6 +90,38 @@ func (r *resolver) resolveNode(identifier string) model.DependencyNode {
 	return node
 }
 
+// resolveEndpoint resolves a telemetry endpoint given the raw OTel service.name
+// (a service-graph client/server, or a db/messaging `service`) plus Beyla's
+// explicit k8s namespace label when present.
+//
+// Beyla emits the BARE service.name and the k8s namespace as a SEPARATE label
+// (k8s.namespace.name) — it never uses the name.namespace DNS form the plain
+// splitClusterDNS path expects. So when we have the namespace label it is the
+// authoritative join key: match (namespace, name) directly. We deliberately do
+// NOT fall back to Beyla's service.namespace attribute — that carries the
+// LOGICAL capability (e.g. "ssu") rather than the real k8s namespace (e.g.
+// "selfservice"), so it would mis-join. Absent a namespace label (uninstrumented
+// endpoints, or Tempo-sourced series that only give an FQDN), defer to resolve,
+// which still handles genuine name.namespace[.svc.cluster.local] identifiers.
+func (r *resolver) resolveEndpoint(name, k8sNamespace string) (model.DependencyNode, string) {
+	if k8sNamespace != "" {
+		if app, found := r.services[k8sNamespace+"/"+name]; found {
+			return model.DependencyNode{
+				Cluster:   r.cluster,
+				Namespace: k8sNamespace,
+				Service:   app,
+			}, kindService
+		}
+	}
+	return r.resolve(name)
+}
+
+// resolveEndpointNode is the node-only variant of resolveEndpoint.
+func (r *resolver) resolveEndpointNode(name, k8sNamespace string) model.DependencyNode {
+	node, _ := r.resolveEndpoint(name, k8sNamespace)
+	return node
+}
+
 // resolveTarget resolves an identifier and classifies what kind of target it is.
 func (r *resolver) resolve(identifier string) (model.DependencyNode, string) {
 	id := strings.TrimSpace(identifier)

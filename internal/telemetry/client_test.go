@@ -30,7 +30,7 @@ func TestInstantQuery_ParsesVector(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "12345", "secret", time.Second)
-	samples, err := c.InstantQuery(context.Background(), serviceGraphQuery)
+	samples, err := c.InstantQuery(context.Background(), serviceGraphMetric)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -199,6 +199,75 @@ func TestApply_ServiceGraphResolution(t *testing.T) {
 	worker := findApp(apps, "worker")
 	if len(worker.KafkaTopics) != 1 || worker.KafkaTopics[0].Name != "kafka" {
 		t.Errorf("worker kafka topics wrong: %+v", worker.KafkaTopics)
+	}
+}
+
+func TestApply_ServiceGraph_BeylaLabels(t *testing.T) {
+	// Beyla emits the BARE service.name plus the k8s namespace as a separate
+	// label — never the name.namespace DNS form. Resolution must join on the
+	// namespace label, and a service.name that matches no workload/service in
+	// its namespace (e.g. a .NET OTEL_SERVICE_NAME) stays honestly external.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"traces_service_graph_request_total": {
+			{Metric: map[string]string{
+				"client": "api", "client_k8s_namespace_name": "cap-a",
+				"server": "worker", "server_k8s_namespace_name": "cap-b",
+			}},
+			{Metric: map[string]string{
+				"client": "api", "client_k8s_namespace_name": "cap-a",
+				"server": "Ferry.CustomsCompliance", "server_k8s_namespace_name": "customs-compliance-cvwbp",
+			}},
+			{Metric: map[string]string{
+				"client": "worker", "client_k8s_namespace_name": "cap-b",
+				"server": "postgresql",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	edges := overlayerWith(stub).Apply(context.Background(), apps)
+
+	var internalEdge, externalEdge *model.DependencyEdge
+	for i := range edges {
+		switch edges[i].Target.Service {
+		case "worker":
+			internalEdge = &edges[i]
+		case "Ferry.CustomsCompliance":
+			externalEdge = &edges[i]
+		}
+	}
+	if internalEdge == nil || internalEdge.Source.External || internalEdge.Target.External {
+		t.Fatalf("expected api.cap-a → worker.cap-b fully resolved, got %+v", internalEdge)
+	}
+	if internalEdge.Source.Service != "api" || internalEdge.Source.Namespace != "cap-a" ||
+		internalEdge.Target.Namespace != "cap-b" {
+		t.Errorf("beyla-label resolution wrong: %+v", internalEdge)
+	}
+	// Unknown service.name in a real namespace → external, not mis-joined.
+	if externalEdge == nil || !externalEdge.Target.External {
+		t.Errorf("unmatched .NET service.name should be external, got %+v", externalEdge)
+	}
+	// worker → postgresql (no namespace label) still classifies as a database.
+	worker := findApp(apps, "worker")
+	if len(worker.Databases) != 1 || worker.Databases[0].System != "postgresql" {
+		t.Errorf("worker postgresql attach wrong: %+v", worker.Databases)
+	}
+}
+
+func TestServiceGraphQuery_ClusterScopedWithNamespaceLabels(t *testing.T) {
+	o := NewOverlayer(nil, "hellman", time.Hour, nil, nil)
+	q := o.serviceGraphQuery()
+	for _, want := range []string{
+		`cluster="hellman"`,
+		"client_k8s_namespace_name",
+		"server_k8s_namespace_name",
+	} {
+		if !contains(q, want) {
+			t.Errorf("service-graph query missing %q: %s", want, q)
+		}
+	}
+	// No cluster configured → no matcher (avoid an empty {} selector).
+	if m := NewOverlayer(nil, "", time.Hour, nil, nil).clusterMatcher(); m != "" {
+		t.Errorf("empty cluster should yield empty matcher, got %q", m)
 	}
 }
 

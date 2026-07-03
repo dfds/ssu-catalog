@@ -23,9 +23,9 @@ const (
 	originMetrics      = "otel-metrics"
 )
 
-// serviceGraphQuery is the primary, reliably-populated source: a ready-made
-// dependency graph from Tempo's metrics generator stored in Mimir.
-const serviceGraphQuery = `count by (client, server) (traces_service_graph_request_total)`
+// serviceGraphMetric is the service-graph counter (emitted by Beyla/OBI and, for
+// OTel-instrumented apps, Tempo's metrics generator) stored in Mimir.
+const serviceGraphMetric = "traces_service_graph_request_total"
 
 // Overlayer queries Mimir and overlays a best-effort runtime dependency graph
 // onto the (already complete) K8s/GitOps/swagger catalog. Failures degrade
@@ -69,10 +69,28 @@ func (o *Overlayer) Apply(ctx context.Context, apps []model.ApplicationEntry) []
 	return edges.list
 }
 
+// serviceGraphQuery aggregates edges while KEEPING the k8s namespace labels
+// Beyla attaches to each side, so resolveEndpoint can join on (namespace, name)
+// instead of parsing the bare service.name. Cluster-scoped: without it, same-name
+// workloads collide across the fleet (namespace+name is only unique per cluster).
+func (o *Overlayer) serviceGraphQuery() string {
+	return fmt.Sprintf(`count by (client, server, client_k8s_namespace_name, server_k8s_namespace_name) (%s%s)`,
+		serviceGraphMetric, o.clusterMatcher())
+}
+
+// clusterMatcher renders the PromQL label matcher scoping a query to this
+// Overlayer's cluster, or "" when no cluster is configured.
+func (o *Overlayer) clusterMatcher() string {
+	if o.cluster == "" {
+		return ""
+	}
+	return fmt.Sprintf(`{cluster=%q}`, o.cluster)
+}
+
 // applyServiceGraph processes the service-graph edges (service→service, →DB,
 // →kafka), attaching DB/Kafka refs to the client application when in-cluster.
 func (o *Overlayer) applyServiceGraph(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
-	samples, err := o.client.InstantQuery(ctx, serviceGraphQuery)
+	samples, err := o.client.InstantQuery(ctx, o.serviceGraphQuery())
 	if err != nil {
 		o.queryFailed("service_graph", err)
 		return
@@ -82,8 +100,8 @@ func (o *Overlayer) applyServiceGraph(ctx context.Context, res *resolver, appByK
 		if client == "" || server == "" {
 			continue
 		}
-		src := res.resolveNode(client)
-		dst, kind := res.resolve(server)
+		src := res.resolveEndpointNode(client, s.Metric["client_k8s_namespace_name"])
+		dst, kind := res.resolveEndpoint(server, s.Metric["server_k8s_namespace_name"])
 
 		edgeType := kind
 		if kind == kindExternal {
@@ -115,7 +133,7 @@ func (o *Overlayer) applyServiceGraph(ctx context.Context, res *resolver, appByK
 
 // applyDatabaseMetrics supplements DB usage from per-service DB metrics.
 func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
-	query := fmt.Sprintf(`count by (service, db_system, db_name) (rate(db_client_operation_duration_seconds_count[%s]))`, o.window())
+	query := fmt.Sprintf(`count by (service, k8s_namespace_name, db_system, db_name) (rate(db_client_operation_duration_seconds_count%s[%s]))`, o.clusterMatcher(), o.window())
 	samples, err := o.client.InstantQuery(ctx, query)
 	if err != nil {
 		o.queryFailed("db", err)
@@ -126,7 +144,7 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 		if service == "" || system == "" {
 			continue
 		}
-		src := res.resolveNode(service)
+		src := res.resolveEndpointNode(service, s.Metric["k8s_namespace_name"])
 		edges.add(model.DependencyEdge{
 			Source:  src,
 			Target:  externalNode(system),
@@ -146,7 +164,7 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 // applyMessagingMetrics supplements Kafka/messaging usage from per-service
 // messaging metrics (best-effort; authoritative topics come from SSU's registry).
 func (o *Overlayer) applyMessagingMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
-	query := fmt.Sprintf(`count by (service, messaging_destination_name, messaging_operation) (rate(messaging_client_operation_duration_seconds_count[%s]))`, o.window())
+	query := fmt.Sprintf(`count by (service, k8s_namespace_name, messaging_destination_name, messaging_operation) (rate(messaging_client_operation_duration_seconds_count%s[%s]))`, o.clusterMatcher(), o.window())
 	samples, err := o.client.InstantQuery(ctx, query)
 	if err != nil {
 		o.queryFailed("messaging", err)
@@ -158,7 +176,7 @@ func (o *Overlayer) applyMessagingMetrics(ctx context.Context, res *resolver, ap
 			continue
 		}
 		direction := messagingDirection(s.Metric["messaging_operation"])
-		src := res.resolveNode(service)
+		src := res.resolveEndpointNode(service, s.Metric["k8s_namespace_name"])
 		edges.add(model.DependencyEdge{
 			Source:  src,
 			Target:  externalNode(dest),
