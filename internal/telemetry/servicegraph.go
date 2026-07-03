@@ -269,6 +269,13 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 		o.queryFailed("db", err)
 		return
 	}
+	// Reconcile intra-peer engine conflicts before attaching. A single peer (one
+	// server_address = one server = one engine) that Beyla stamps with more than
+	// one db_system is eBPF misdetection: the real engine carries continuous query
+	// traffic (a high summed operation rate) while the fabricated one shows only
+	// sparse bursts, so we trust the dominant engine per (workload, peer) and drop
+	// the rest. See engineWinners for the exact rule (ties keep both).
+	winners := engineWinners(res, samples)
 	for _, s := range samples {
 		// db.system.name is the current OTel semconv label; db_system is the legacy
 		// name. Read both so a semconv rename doesn't silently blank the engine.
@@ -276,6 +283,14 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 		dbName := s.Metric["db_name"]
 		rawHost := stripPort(s.Metric["server_address"])
 		host := rawHost
+		// Drop a fabricated engine label when this same (workload, peer) also carries
+		// the true, dominant engine. Only fires on a genuine multi-engine conflict;
+		// single-engine peers are never in the map, so ordinary DBs are untouched.
+		if system != "" {
+			if keep, conflicted := winners[engineConflictKey(res.resolveClient(s.Metric), rawHost)]; conflicted && !keep[system] {
+				continue
+			}
+		}
 		// Reject OpenTelemetry collector peers. Beyla stamps a (fabricated, always
 		// postgresql) db_system on the gRPC/HTTP-2 stream a workload uses to EXPORT OTLP
 		// to its otel-collector-service, surfacing the collector as a phantom database
@@ -341,6 +356,63 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 			attachDatabaseNamed(app, system, name, originMetrics)
 		}
 	}
+}
+
+// engineConflictKey identifies a (client workload, peer host) pair for
+// engine-conflict reconciliation. The host is the raw db_client server_address
+// (pre-reverse-DNS): Beyla reports every engine sample for one peer under the
+// same address, so grouping on it collects the conflicting engines together.
+func engineConflictKey(src model.DependencyNode, rawHost string) string {
+	return src.Namespace + "/" + src.Service + "\x00" + rawHost
+}
+
+// engineWinners resolves Beyla's intra-peer engine conflicts. A single peer is one
+// server (one address → one engine), yet Beyla's eBPF SQL autodetection fabricates
+// a second engine on the opaque TLS/gRPC stream to a genuine database — stamping,
+// say, both mysql and postgresql on the same RDS box. The real engine carries
+// continuous query traffic and so a high summed db_client operation rate, while the
+// fabricated one appears only as sparse, bursty misdetections. So per (client
+// workload, peer host) we keep the engine(s) with the maximum summed Sample.Value
+// and drop the strictly-dominated ones. Exact ties keep every tied engine: with
+// equal evidence there is no basis to choose, and showing both beats guessing
+// wrong. Peers carrying a single engine are omitted entirely, so ordinary
+// one-engine databases are never reconciled. Returns, per conflicted key, the set
+// of engines to keep.
+func engineWinners(res *resolver, samples []Sample) map[string]map[string]bool {
+	totals := map[string]map[string]float64{}
+	for _, s := range samples {
+		system := firstNonEmpty(s.Metric["db_system_name"], s.Metric["db_system"])
+		if system == "" {
+			continue
+		}
+		key := engineConflictKey(res.resolveClient(s.Metric), stripPort(s.Metric["server_address"]))
+		byEngine := totals[key]
+		if byEngine == nil {
+			byEngine = map[string]float64{}
+			totals[key] = byEngine
+		}
+		byEngine[system] += s.Value
+	}
+	winners := map[string]map[string]bool{}
+	for key, byEngine := range totals {
+		if len(byEngine) < 2 {
+			continue // single engine — no conflict to reconcile
+		}
+		max := 0.0
+		for _, v := range byEngine {
+			if v > max {
+				max = v
+			}
+		}
+		keep := map[string]bool{}
+		for eng, v := range byEngine {
+			if v >= max {
+				keep[eng] = true // dominant engine, or tied for the lead
+			}
+		}
+		winners[key] = keep
+	}
+	return winners
 }
 
 // applyMessagingMetrics supplements Kafka/messaging usage from per-service

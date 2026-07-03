@@ -607,6 +607,86 @@ func TestApply_DBClient_DropsOTLPCollectorPhantom(t *testing.T) {
 	}
 }
 
+func TestApply_DBClient_ResolvesEngineConflictByDominance(t *testing.T) {
+	// A single peer is one server (one address → one engine), yet Beyla's eBPF SQL
+	// autodetection fabricates a second engine on the opaque TLS stream to a genuine
+	// database — here stamping the SAME RDS box as both postgresql and mysql. The real
+	// engine carries continuous query traffic (high summed db_client rate); the
+	// fabricated one appears only as sparse bursts. So the dominant engine wins per
+	// (workload, peer) and the phantom is dropped — WITHOUT losing the peer. (Mirrors
+	// ssu-mgmt → its Postgres RDS being intermittently mislabelled mysql.)
+	const rdsIP = "203.0.113.55" // documentation range; one server, one real engine
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"db_client_operation_duration_seconds_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": rdsIP, "db_system_name": "postgresql",
+			}, Value: 8}, // sustained real query traffic
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": rdsIP, "db_system_name": "mysql",
+			}, Value: 1}, // sparse fabricated burst
+		},
+	}}
+	o := overlayerWith(stub)
+	o.lookupAddr = func(_ context.Context, ip string) ([]string, error) {
+		if ip == rdsIP {
+			return []string{"orders.abc123.eu-west-1.rds.example.com."}, nil
+		}
+		return nil, nil
+	}
+	apps := sampleApps()
+	edges := o.Apply(context.Background(), apps)
+
+	api := findApp(apps, "api")
+	if len(api.Databases) != 1 || api.Databases[0].System != "postgresql" ||
+		api.Databases[0].Name != "orders.abc123.eu-west-1.rds.example.com" {
+		t.Fatalf("dominant postgres should win, fabricated mysql dropped, got %+v", api.Databases)
+	}
+	// Both engine samples point at the same host, so they collapse to one DB edge.
+	if len(edges) != 1 || edges[0].Type != kindDatabase {
+		t.Errorf("expected exactly one database edge, got %d: %+v", len(edges), edges)
+	}
+}
+
+func TestApply_DBClient_EngineConflictTieKeepsBoth(t *testing.T) {
+	// When two engines on one peer carry EQUAL evidence (a genuine near-tie — e.g. a
+	// low-traffic dev workload where both the real and the fabricated engine show a
+	// single sparse sample), there is no basis to pick one, so both are kept.
+	// Conservative on purpose: showing both beats silently guessing wrong.
+	const peerIP = "203.0.113.60"
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"db_client_operation_duration_seconds_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": peerIP, "db_system_name": "postgresql",
+			}, Value: 1},
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": peerIP, "db_system_name": "mysql",
+			}, Value: 1},
+		},
+	}}
+	o := overlayerWith(stub)
+	o.lookupAddr = func(_ context.Context, ip string) ([]string, error) {
+		if ip == peerIP {
+			return []string{"ambiguous.abc123.eu-west-1.rds.example.com."}, nil
+		}
+		return nil, nil
+	}
+	apps := sampleApps()
+	o.Apply(context.Background(), apps)
+
+	api := findApp(apps, "api")
+	engines := map[string]bool{}
+	for _, db := range api.Databases {
+		engines[db.System] = true
+	}
+	if len(api.Databases) != 2 || !engines["postgresql"] || !engines["mysql"] {
+		t.Fatalf("tie should keep both engines, got %+v", api.Databases)
+	}
+}
+
 func TestIsOTLPCollectorPeer(t *testing.T) {
 	cases := map[string]bool{
 		"otel-collector-service":                                  true,
