@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -155,21 +156,49 @@ func TestProbe_OptOutAnnotation(t *testing.T) {
 	}
 }
 
-func TestProbe_PathOverride(t *testing.T) {
+func TestProbe_PathComplementsDefaults(t *testing.T) {
+	var mu sync.Mutex
 	var probedPaths []string
 	rt := roundTripFunc(func(req *http.Request) *http.Response {
+		mu.Lock()
 		probedPaths = append(probedPaths, req.URL.Path)
+		mu.Unlock()
 		return resp(200, "application/json", `{"openapi":"3.0.0"}`)
 	})
 	apps := appWithService(80)
 	apps[0].Annotations = map[string]string{annoProbePath: "/custom/openapi.json"}
-	probes, hits := newTestProber(rt).Probe(context.Background(), apps)
-	if probes != 1 || hits != 1 {
-		t.Fatalf("override should probe exactly one path, got probes=%d hits=%d", probes, hits)
+	probes, _ := newTestProber(rt).Probe(context.Background(), apps)
+	// The declared path complements the defaults rather than replacing them.
+	if probes != len(defaultPaths)+1 {
+		t.Fatalf("expected defaults + custom path, got %d probes (want %d)", probes, len(defaultPaths)+1)
 	}
-	if len(probedPaths) != 1 || probedPaths[0] != "/custom/openapi.json" {
-		t.Errorf("override path not honoured: %+v", probedPaths)
+	if !contains(probedPaths, "/custom/openapi.json") {
+		t.Errorf("custom path not probed: %+v", probedPaths)
 	}
+	if !contains(probedPaths, defaultPaths[0]) {
+		t.Errorf("default paths no longer probed: %+v", probedPaths)
+	}
+}
+
+func TestProbe_PathEqualToDefaultNotDuplicated(t *testing.T) {
+	rt := roundTripFunc(func(req *http.Request) *http.Response {
+		return resp(404, "text/plain", "")
+	})
+	apps := appWithService(80)
+	apps[0].Annotations = map[string]string{annoProbePath: defaultPaths[0]}
+	probes, _ := newTestProber(rt).Probe(context.Background(), apps)
+	if probes != len(defaultPaths) {
+		t.Errorf("override equal to a default should not add a probe, got %d (want %d)", probes, len(defaultPaths))
+	}
+}
+
+func contains(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func TestProbe_NoServicesNoJobs(t *testing.T) {

@@ -166,8 +166,8 @@ func TestCollect_GitOpsDeploymentSource(t *testing.T) {
 	if api.DeploymentSource == nil {
 		t.Fatal("expected api to have a deployment source")
 	}
-	if api.DeploymentSource.Tool != "argocd" || api.RepoURL != "https://github.com/example/apps" {
-		t.Errorf("deployment source wrong: %+v repo=%q", api.DeploymentSource, api.RepoURL)
+	if api.DeploymentSource.Tool != "argocd" || len(api.RepoURLs) != 1 || api.RepoURLs[0] != "https://github.com/example/apps" {
+		t.Errorf("deployment source wrong: %+v repos=%v", api.DeploymentSource, api.RepoURLs)
 	}
 	if cat.Stats.ApplicationsWithDeploySource != 1 {
 		t.Errorf("ApplicationsWithDeploySource = %d, want 1", cat.Stats.ApplicationsWithDeploySource)

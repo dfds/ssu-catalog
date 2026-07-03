@@ -97,21 +97,45 @@ func NewResolver(crs []kubernetes.GitOpsSourceInfo) *Resolver {
 
 // Resolve attributes a deployment source to a workload from its tracking
 // metadata. It returns the source (nil when neither Argo nor Flux nor a repo
-// hint matches) and the best-effort repo URL for the application entry.
-func (r *Resolver) Resolve(namespace string, labels, annotations map[string]string) (*model.DeploymentSource, string) {
+// hint matches) and the repo URLs for the application entry: the discovered
+// repo (Argo/Flux) plus any author-declared dfds.cloud/repo / git-origin,
+// deduped and discovered-first. A declared repo complements — never overrides —
+// the discovered one.
+func (r *Resolver) Resolve(namespace string, labels, annotations map[string]string) (*model.DeploymentSource, []string) {
+	src := r.resolveSource(labels, annotations)
+	var repos []string
+	if src != nil && src.RepoURL != "" {
+		repos = append(repos, src.RepoURL)
+	}
+	if declared := fallbackRepoURL(labels, annotations); declared != "" {
+		repos = appendUnique(repos, declared)
+	}
+	return src, repos
+}
+
+// resolveSource picks the first matching deployment source: Argo → Flux Helm →
+// Flux Kustomize → tool-less repo hint. nil when nothing matches.
+func (r *Resolver) resolveSource(labels, annotations map[string]string) *model.DeploymentSource {
 	if src := r.resolveArgo(labels, annotations); src != nil {
-		return src, src.RepoURL
+		return src
 	}
 	if src := r.resolveFluxHelm(labels); src != nil {
-		return src, src.RepoURL
+		return src
 	}
 	if src := r.resolveFluxKustomize(labels); src != nil {
-		return src, src.RepoURL
+		return src
 	}
-	if src := fallbackSource(labels, annotations); src != nil {
-		return src, src.RepoURL
+	return fallbackSource(labels, annotations)
+}
+
+// appendUnique appends value unless it is already present.
+func appendUnique(slice []string, value string) []string {
+	for _, existing := range slice {
+		if existing == value {
+			return slice
+		}
 	}
-	return nil, fallbackRepoURL(labels, annotations)
+	return append(slice, value)
 }
 
 func (r *Resolver) resolveArgo(labels, annotations map[string]string) *model.DeploymentSource {

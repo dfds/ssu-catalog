@@ -71,8 +71,8 @@ func TestResolve_ArgoTrackingID(t *testing.T) {
 	if src.Tool != "argocd" || src.AppName != "my-app" {
 		t.Errorf("argo attribution wrong: %+v", src)
 	}
-	if src.RepoURL != "https://github.com/example/apps" || repo != src.RepoURL {
-		t.Errorf("repo wrong: src=%q repo=%q", src.RepoURL, repo)
+	if src.RepoURL != "https://github.com/example/apps" || len(repo) != 1 || repo[0] != src.RepoURL {
+		t.Errorf("repo wrong: src=%q repo=%v", src.RepoURL, repo)
 	}
 	if src.Path != "apps/my-app" || src.Revision != "main" {
 		t.Errorf("path/revision wrong: %+v", src)
@@ -136,8 +136,8 @@ func TestResolve_FluxHelm(t *testing.T) {
 	if src == nil || src.Tool != "flux-helm" || src.AppName != "api" {
 		t.Fatalf("flux-helm attribution wrong: %+v", src)
 	}
-	if src.RepoURL != "https://github.com/example/manifests" || repo != src.RepoURL {
-		t.Errorf("repo wrong: %+v repo=%q", src, repo)
+	if src.RepoURL != "https://github.com/example/manifests" || len(repo) != 1 || repo[0] != src.RepoURL {
+		t.Errorf("repo wrong: %+v repo=%v", src, repo)
 	}
 	if src.Revision != "main" {
 		t.Errorf("revision wrong: %+v", src)
@@ -166,8 +166,8 @@ func TestResolve_FluxHelmLabelsButNoCR(t *testing.T) {
 	if src == nil || src.Tool != "flux-helm" || src.AppName != "api" {
 		t.Fatalf("expected attribution from labels alone, got %+v", src)
 	}
-	if src.RepoURL != "" || repo != "" {
-		t.Errorf("expected blank repo, got %q / %q", src.RepoURL, repo)
+	if src.RepoURL != "" || len(repo) != 0 {
+		t.Errorf("expected blank repo, got %q / %v", src.RepoURL, repo)
 	}
 }
 
@@ -200,8 +200,8 @@ func TestResolve_FallbackRepoAnnotation(t *testing.T) {
 	if src == nil || src.Tool != "" {
 		t.Fatalf("expected tool-less fallback source, got %+v", src)
 	}
-	if src.RepoURL != "https://github.com/example/standalone" || repo != src.RepoURL {
-		t.Errorf("fallback repo wrong: %+v repo=%q", src, repo)
+	if src.RepoURL != "https://github.com/example/standalone" || len(repo) != 1 || repo[0] != src.RepoURL {
+		t.Errorf("fallback repo wrong: %+v repo=%v", src, repo)
 	}
 	if src.AppName != "billing" {
 		t.Errorf("expected part-of as appName, got %q", src.AppName)
@@ -214,8 +214,39 @@ func TestResolve_None(t *testing.T) {
 	if src != nil {
 		t.Errorf("expected nil source, got %+v", src)
 	}
-	if repo != "" {
-		t.Errorf("expected blank repo, got %q", repo)
+	if len(repo) != 0 {
+		t.Errorf("expected empty repo list, got %v", repo)
+	}
+}
+
+// A declared dfds.cloud/repo complements — does not override — the discovered
+// repo: both appear, discovered-first, deduped.
+func TestResolve_DeclaredRepoComplementsDiscovered(t *testing.T) {
+	r := NewResolver([]kubernetes.GitOpsSourceInfo{
+		argoApp("argocd", "my-app", "https://github.com/example/apps", "p", "main"),
+	})
+	annotations := map[string]string{
+		annoArgoTrackingID: "my-app:apps/Deployment:cap-a/api",
+		"dfds.cloud/repo":  "https://github.com/team/service",
+	}
+	src, repo := r.Resolve("cap-a", nil, annotations)
+	if src == nil || src.RepoURL != "https://github.com/example/apps" {
+		t.Fatalf("expected discovered argo source, got %+v", src)
+	}
+	want := []string{"https://github.com/example/apps", "https://github.com/team/service"}
+	if len(repo) != len(want) {
+		t.Fatalf("expected %v, got %v", want, repo)
+	}
+	for i := range want {
+		if repo[i] != want[i] {
+			t.Errorf("repo[%d] = %q, want %q (full: %v)", i, repo[i], want[i], repo)
+		}
+	}
+
+	// A declared repo equal to the discovered one is not duplicated.
+	annotations["dfds.cloud/repo"] = "https://github.com/example/apps"
+	if _, repo = r.Resolve("cap-a", nil, annotations); len(repo) != 1 {
+		t.Errorf("expected deduped single repo, got %v", repo)
 	}
 }
 

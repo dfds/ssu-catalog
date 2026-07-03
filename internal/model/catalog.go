@@ -49,12 +49,15 @@ type ApplicationEntry struct {
 	Containers    []ContainerInfo `json:"containers"` // image + tag + ports + resources
 
 	// Deployment / repository (GitOps-derived; see GitOps Source Discovery)
-	RepoURL          string            `json:"repoUrl"`          // DeploymentSource.RepoURL, else label/annotation fallback
+	RepoURLs         []string          `json:"repoUrls"`         // discovered repo(s) + declared dfds.cloud/repo/git-origin, deduped, discovered-first
 	DeploymentSource *DeploymentSource `json:"deploymentSource"` // nil when not GitOps-managed
 
 	// Best-effort owner (authoritative values joined SSU-side; may be empty)
 	Owner   string `json:"owner"`
 	Contact string `json:"contact"`
+
+	// Author-declared metadata (dfds.cloud/* annotations); nil when none declared
+	Metadata *AppMetadata `json:"metadata"`
 
 	// Attached networking / API surface
 	Services []ServiceRef `json:"services"` // matched K8s Services; empty for background consumers
@@ -86,6 +89,20 @@ type RouteRef struct {
 	PathPrefixes []string `json:"pathPrefixes"` // literal PathPrefix(`…`) / Path(`…`) matchers
 	EntryPoints  []string `json:"entryPoints"`  // spec.entryPoints
 	TLS          bool     `json:"tls"`          // spec.tls present
+}
+
+// AppMetadata is author-declared catalog metadata read from dfds.cloud/*
+// annotations on the workload. nil when nothing is declared (matches the
+// nil-when-absent convention used for DeploymentSource).
+type AppMetadata struct {
+	Description string `json:"description"` // dfds.cloud/description
+	Links       []Link `json:"links"`       // dfds.cloud/link.<label>=<url>
+}
+
+// Link is an author-declared reference URL (runbook, dashboard, docs…).
+type Link struct {
+	Label string `json:"label"` // annotation suffix after dfds.cloud/link.
+	URL   string `json:"url"`
 }
 
 type DeploymentSource struct {

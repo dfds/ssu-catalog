@@ -23,7 +23,7 @@ import (
 // Workload annotations controlling probe behaviour.
 const (
 	annoProbeOptOut = "dfds.cloud/openapi-probe" // "false" → skip the application
-	annoProbePath   = "dfds.cloud/openapi-path"  // override → probe only this path
+	annoProbePath   = "dfds.cloud/openapi-path"  // extra path probed alongside the defaults
 )
 
 // maxProbeBodyBytes caps how much of a probe response we read for validation.
@@ -137,8 +137,8 @@ func buildJobs(apps []model.ApplicationEntry) []job {
 			continue
 		}
 		paths := defaultPaths
-		if override := app.Annotations[annoProbePath]; override != "" {
-			paths = []string{override}
+		if extra := app.Annotations[annoProbePath]; extra != "" {
+			paths = withPath(defaultPaths, extra)
 		}
 		for svcIdx := range app.Services {
 			svc := &app.Services[svcIdx]
@@ -156,6 +156,20 @@ func buildJobs(apps []model.ApplicationEntry) []job {
 		}
 	}
 	return jobs
+}
+
+// withPath returns the default paths plus extra, appended only when it isn't
+// already one of the defaults (so an override equal to a default isn't probed
+// twice). The declared path complements — never replaces — the defaults.
+func withPath(defaults []string, extra string) []string {
+	for _, p := range defaults {
+		if p == extra {
+			return defaults
+		}
+	}
+	out := make([]string, len(defaults), len(defaults)+1)
+	copy(out, defaults)
+	return append(out, extra)
 }
 
 // probeOne issues a single GET. A hit is HTTP 200 whose body validates as an

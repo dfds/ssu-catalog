@@ -8,6 +8,7 @@ import (
 
 	"go.dfds.cloud/ssu-catalog/internal/gitops"
 	"go.dfds.cloud/ssu-catalog/internal/kubernetes"
+	"go.dfds.cloud/ssu-catalog/internal/metadata"
 	"go.dfds.cloud/ssu-catalog/internal/model"
 	"go.dfds.cloud/ssu-catalog/internal/swagger"
 	"go.dfds.cloud/ssu-catalog/internal/telemetry"
@@ -204,10 +205,13 @@ func (c *Collector) buildApplications(
 		}
 		app.Services = services
 
-		// GitOps attribution — repo + deployment source from tracking metadata.
-		source, repoURL := resolver.Resolve(w.Namespace, w.Labels, w.Annotations)
+		// GitOps attribution — repo(s) + deployment source from tracking metadata.
+		source, repoURLs := resolver.Resolve(w.Namespace, w.Labels, w.Annotations)
 		app.DeploymentSource = source
-		app.RepoURL = repoURL
+		app.RepoURLs = repoURLs
+
+		// Author-declared metadata (description + reference links).
+		app.Metadata = metadata.From(w.Annotations)
 
 		apps = append(apps, app)
 	}
