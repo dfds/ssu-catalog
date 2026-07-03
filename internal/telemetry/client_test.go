@@ -497,39 +497,49 @@ func TestApply_DBClient_DropsUnidentifiableNoise(t *testing.T) {
 
 func TestApply_DBClient_DropsPhantomWhenReachedOverHTTP(t *testing.T) {
 	// Beyla's eBPF misdetects an HTTP/gRPC-on-443 stream as a db_client call and
-	// stamps a bogus engine on it. The discriminator is PER WORKLOAD: `api` only
+	// stamps a bogus engine on it. Crucially, http_client reports the peer by
+	// HOSTNAME while db_client reports the SAME peer by IP, so the join must bridge
+	// hostname↔IP via forward DNS. The discriminator is PER WORKLOAD: `api` only
 	// talks to the shared host over HTTP, so its db_client→postgresql is a phantom
-	// and must be dropped — while `worker`, which reaches the SAME host only over
-	// the DB protocol, keeps its real postgres. (Mirrors an HTTP-API hostname that
+	// and must be dropped — while `worker`, which reaches the SAME IP only over the
+	// DB protocol, keeps its real postgres. (Mirrors an HTTP-API hostname that
 	// shares a public IP with an unrelated RDS box.)
-	const shared = "logisticsapi.example.com"
+	const sharedHost = "logisticsapi.example.com"
+	const sharedIP = "203.0.113.70" // documentation range; hostname resolves here
 	stub := &stubClient{byQuery: map[string][]Sample{
 		"http_client_request_body_size_bytes_count": {
 			{Metric: map[string]string{
 				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
-				"server_address": shared, "server_port": "443",
+				"server_address": sharedHost, "server_port": "443",
 			}},
 		},
 		"db_client_operation_duration_seconds_count": {
 			{Metric: map[string]string{
 				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
-				"server_address": shared, "db_system_name": "postgresql",
+				"server_address": sharedIP, "db_system_name": "postgresql",
 			}},
 			{Metric: map[string]string{
 				"k8s_namespace_name": "cap-b", "k8s_deployment_name": "worker", "service": "beyla",
-				"server_address": shared, "db_system_name": "postgresql",
+				"server_address": sharedIP, "db_system_name": "postgresql",
 			}},
 		},
 	}}
+	o := overlayerWith(stub)
+	o.lookupHost = func(_ context.Context, host string) ([]string, error) {
+		if host == sharedHost {
+			return []string{sharedIP}, nil
+		}
+		return nil, nil
+	}
 	apps := sampleApps()
-	edges := overlayerWith(stub).Apply(context.Background(), apps)
+	edges := o.Apply(context.Background(), apps)
 
 	if api := findApp(apps, "api"); len(api.Databases) != 0 {
 		t.Fatalf("phantom DB should be dropped for the HTTP caller, got %+v", api.Databases)
 	}
 	worker := findApp(apps, "worker")
 	if len(worker.Databases) != 1 || worker.Databases[0].System != "postgresql" ||
-		worker.Databases[0].Name != shared {
+		worker.Databases[0].Name != sharedIP {
 		t.Fatalf("real postgres should survive for the DB-only caller, got %+v", worker.Databases)
 	}
 	// One service edge (api's HTTP egress) + one database edge (worker's real DB);

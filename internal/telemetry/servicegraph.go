@@ -52,6 +52,14 @@ type Overlayer struct {
 	lookupAddr func(ctx context.Context, ip string) ([]string, error)
 	ptrMu      sync.Mutex
 	ptrCache   map[string]string
+
+	// lookupHost forward-resolves a hostname to its IPs; nil defaults to a
+	// time-bounded DNS lookup. Overridable in tests to avoid real DNS. Used to
+	// join HTTP peers (reported by hostname) against db_client peers (reported by
+	// IP) so a phantom DB on an HTTP host's IP can be dropped.
+	lookupHost func(ctx context.Context, host string) ([]string, error)
+	hostMu     sync.Mutex
+	hostCache  map[string][]string
 }
 
 // NewOverlayer builds an Overlayer. queryErrors may be nil (e.g. in tests).
@@ -188,7 +196,17 @@ func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey
 		// workload reaches over HTTP/gRPC is not its database, however confidently
 		// eBPF stamped a db_system on the same TLS-on-443 stream. Recorded before the
 		// keep filter so a private-IP HTTP peer still shadows a phantom DB.
-		httpPeers.add(src.Namespace+"/"+src.Service, firstNonEmpty(host, stripPort(addr)))
+		appKey := src.Namespace + "/" + src.Service
+		peerHost := firstNonEmpty(host, stripPort(addr))
+		httpPeers.add(appKey, peerHost)
+		// Beyla reports HTTP peers by HOSTNAME (Host header / SNI) but db_client
+		// peers by IP, so also index the hostname's resolved IPs — otherwise the DB
+		// overlay's IP peer never matches this HTTP host and the phantom survives.
+		if !isBareIP(peerHost) {
+			for _, ip := range o.forwardLookup(ctx, peerHost) {
+				httpPeers.add(appKey, ip)
+			}
+		}
 		if !keep {
 			continue // private/infra IP (kube API server, node/pod IPs)
 		}
@@ -256,7 +274,8 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 		// name. Read both so a semconv rename doesn't silently blank the engine.
 		system := firstNonEmpty(s.Metric["db_system_name"], s.Metric["db_system"])
 		dbName := s.Metric["db_name"]
-		host := stripPort(s.Metric["server_address"])
+		rawHost := stripPort(s.Metric["server_address"])
+		host := rawHost
 		port := peerPort(s.Metric, s.Metric["server_address"])
 		// Infer the engine from a well-known DB peer port (5432→postgresql, …) on the
 		// rare series that carries one, when the engine label is absent.
@@ -284,9 +303,14 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 		// database for one workload still attaches there while being dropped as a
 		// mere HTTP peer for another (e.g. an API hostname sharing an IP with an RDS
 		// box: real postgres for booking-auto-approval, phantom for a workload that
-		// only calls its HTTP API).
-		if !src.External && httpPeers.has(src.Namespace+"/"+src.Service, host) {
-			continue
+		// only calls its HTTP API). Match on the raw peer (db_client reports the IP)
+		// AND the reverse-resolved host, since the HTTP index carries both the
+		// hostname and its forward-resolved IPs.
+		if !src.External {
+			appKey := src.Namespace + "/" + src.Service
+			if httpPeers.has(appKey, rawHost) || httpPeers.has(appKey, host) {
+				continue
+			}
 		}
 		// Identify the instance by its logical db_name when instrumented, else by the
 		// peer host; point the edge at the concrete host when we have one.
@@ -411,6 +435,41 @@ func (o *Overlayer) reverseLookup(ctx context.Context, ip string) string {
 	o.ptrCache[ip] = name
 	o.ptrMu.Unlock()
 	return name
+}
+
+// forwardLookup returns the IPs a hostname resolves to, or nil. Results (misses
+// included) are cached for the Overlayer's lifetime and each lookup is
+// time-bounded, so a slow or blocked resolver can't stall a scan. Used to align
+// HTTP peers (hostnames) with db_client peers (IPs) for phantom-DB rejection.
+func (o *Overlayer) forwardLookup(ctx context.Context, host string) []string {
+	o.hostMu.Lock()
+	if o.hostCache == nil {
+		o.hostCache = map[string][]string{}
+	} else if ips, ok := o.hostCache[host]; ok {
+		o.hostMu.Unlock()
+		return ips
+	}
+	o.hostMu.Unlock()
+
+	lookup := o.lookupHost
+	if lookup == nil {
+		lookup = func(ctx context.Context, host string) ([]string, error) {
+			ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			return net.DefaultResolver.LookupHost(ctx, host)
+		}
+	}
+	addrs, _ := lookup(ctx, host)
+	ips := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		if ip := strings.TrimSpace(a); ip != "" && isBareIP(ip) {
+			ips = append(ips, ip)
+		}
+	}
+	o.hostMu.Lock()
+	o.hostCache[host] = ips
+	o.hostMu.Unlock()
+	return ips
 }
 
 // messagingDirection maps an OTel messaging.operation value to produce/consume.
