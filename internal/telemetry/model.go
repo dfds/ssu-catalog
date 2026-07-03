@@ -50,6 +50,28 @@ var wellKnownPorts = map[string]string{
 	"5672":  "rabbitmq",
 }
 
+// isDatabasePort reports whether a bare port is a well-known database port
+// (5432, 3306, …). It is the positive signal that a db_client series really
+// targets a database: a real DB dependency talks a DB port, whereas Beyla's
+// eBPF protocol autodetection misfires on opaque/encrypted egress — TLS on 443,
+// gRPC/OTLP on 4317, plain HTTP — and emits a spurious db_client series (often
+// with a bogus db_system_name) for a peer that is really an HTTP/gRPC API.
+func isDatabasePort(port string) bool {
+	sys, ok := wellKnownPorts[port]
+	if !ok {
+		return false
+	}
+	_, isDB := databaseSystems[sys]
+	return isDB
+}
+
+// isKnownDBEngine reports whether an OTel db.system(.name) value names a
+// database engine we recognise (case-insensitive).
+func isKnownDBEngine(system string) bool {
+	_, ok := databaseSystems[strings.ToLower(strings.TrimSpace(system))]
+	return ok
+}
+
 // databaseSystems and messagingSystems are generic data-system strings that may
 // appear unnormalized as a service-graph `server`.
 var databaseSystems = map[string]struct{}{

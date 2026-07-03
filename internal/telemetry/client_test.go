@@ -371,10 +371,11 @@ func TestApply_HTTPClientResolvesExternalEgress(t *testing.T) {
 	}
 }
 
-func TestApply_DBClientByServerAddress(t *testing.T) {
-	// Beyla eBPF often has no logical db_system/db_name — only the peer address
-	// (e.g. a managed-DB endpoint). Attribute the caller via its k8s labels (not
-	// the `service` label, which is the Beyla collector) and use the host as DB.
+func TestApply_DBClient_DropsPortlessEnginelessNoise(t *testing.T) {
+	// A db_client series with neither a peer port nor a recognised engine carries
+	// no positive evidence that the peer is a database — it is the shape Beyla's
+	// eBPF protocol autodetection produces when it misfires. Drop it rather than
+	// surface a bare address as a phantom database.
 	stub := &stubClient{byQuery: map[string][]Sample{
 		"db_client_operation_duration_seconds_count": {
 			{Metric: map[string]string{
@@ -386,15 +387,43 @@ func TestApply_DBClientByServerAddress(t *testing.T) {
 	apps := sampleApps()
 	edges := overlayerWith(stub).Apply(context.Background(), apps)
 
-	api := findApp(apps, "api")
-	if len(api.Databases) != 1 || api.Databases[0].Name != "198.51.100.20" {
-		t.Fatalf("expected DB host attached as a database, got %+v", api.Databases)
+	if api := findApp(apps, "api"); len(api.Databases) != 0 {
+		t.Fatalf("expected no database attached for portless/engineless noise, got %+v", api.Databases)
 	}
-	if api.Databases[0].System != "" || api.Databases[0].Source != originMetrics {
-		t.Errorf("expected empty system + otel-metrics source, got %+v", api.Databases[0])
+	if len(edges) != 0 {
+		t.Errorf("expected no database edge, got %+v", edges)
 	}
-	if len(edges) != 1 || edges[0].Type != kindDatabase || edges[0].Target.Service != "198.51.100.20" {
-		t.Errorf("expected 1 database edge to the DB host, got %+v", edges)
+}
+
+func TestApply_DBClient_DropsNonDBPortMisdetection(t *testing.T) {
+	// Beyla's eBPF protocol autodetection misfires on opaque/encrypted egress —
+	// TLS on 443, gRPC/OTLP on 4317 — emitting a db_client series (sometimes even
+	// with a bogus db_system_name) for a peer that is really an HTTP/gRPC API. The
+	// peer port is the reliable discriminator: a non-DB port means it is not a
+	// database, whatever the (guessed) engine label says.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"db_client_operation_duration_seconds_count": {
+			// HTTPS website misdetected as postgresql — port 443 in server_port.
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "site.example.com", "server_port": "443",
+				"db_system_name": "postgresql",
+			}},
+			// OTLP/gRPC collector misdetected — port 4317 embedded in the address.
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "otel-collector.example.com:4317",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	edges := overlayerWith(stub).Apply(context.Background(), apps)
+
+	if api := findApp(apps, "api"); len(api.Databases) != 0 {
+		t.Fatalf("expected no database attached for non-DB-port peers, got %+v", api.Databases)
+	}
+	if len(edges) != 0 {
+		t.Errorf("expected no database edge for HTTP/gRPC peers, got %+v", edges)
 	}
 }
 
@@ -467,6 +496,30 @@ func TestApply_DBClient_PortInfersSystem(t *testing.T) {
 	}
 	if len(edges) != 1 || edges[0].Target.Service != "db.example.rds.example.com" {
 		t.Errorf("expected edge to the resolved DB host, got %+v", edges)
+	}
+}
+
+func TestApply_DBClient_KeepsDBPortFromServerPortLabel(t *testing.T) {
+	// The DB port arrives in the dedicated server_port label (revealed via Beyla's
+	// attributes.select). A well-known DB port is positive evidence, so the edge is
+	// kept and the engine inferred from the port when the label is absent.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"db_client_operation_duration_seconds_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "db.example.com", "server_port": "5432",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	edges := overlayerWith(stub).Apply(context.Background(), apps)
+
+	api := findApp(apps, "api")
+	if len(api.Databases) != 1 || api.Databases[0].System != "postgresql" || api.Databases[0].Name != "db.example.com" {
+		t.Fatalf("expected postgresql DB on db.example.com, got %+v", api.Databases)
+	}
+	if len(edges) != 1 || edges[0].Type != kindDatabase || edges[0].Target.Service != "db.example.com" {
+		t.Errorf("expected 1 database edge to db.example.com, got %+v", edges)
 	}
 }
 

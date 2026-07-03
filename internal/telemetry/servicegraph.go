@@ -216,13 +216,18 @@ func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey
 
 // applyDatabaseMetrics supplements DB usage from per-service DB metrics. Beyla is
 // eBPF-only, so it rarely knows the logical db_system/db_name — but it always has
-// the peer server_address (e.g. an RDS endpoint). Attribute the caller via its
-// k8s labels (the `service` label is the Beyla collector, not the app), infer the
-// engine from the peer port when db_system is absent, and fall back to the
-// (reverse-resolved) address as the database identity.
+// the peer server_address (e.g. an RDS endpoint) and server_port. Attribute the
+// caller via its k8s labels (the `service` label is the Beyla collector, not the
+// app), infer the engine from the peer port when db_system is absent, and fall
+// back to the (reverse-resolved) address as the database identity.
+//
+// Beyla's eBPF protocol autodetection misfires on opaque/encrypted egress (TLS,
+// gRPC/OTLP) and emits spurious db_client series for peers that are really
+// HTTP/gRPC APIs — so require POSITIVE evidence of a database before drawing a
+// DB edge: a well-known DB peer port, or (absent a port) a recognised engine.
 func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
 	query := fmt.Sprintf(
-		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, db_system_name, db_system, db_name, server_address) (rate(db_client_operation_duration_seconds_count%s[%s]))`,
+		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, db_system_name, db_system, db_name, server_address, server_port) (rate(db_client_operation_duration_seconds_count%s[%s]))`,
 		o.clusterMatcher(), o.window(),
 	)
 	samples, err := o.client.InstantQuery(ctx, query)
@@ -237,12 +242,24 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 		system := firstNonEmpty(s.Metric["db_system_name"], s.Metric["db_system"])
 		dbName := s.Metric["db_name"]
 		host := stripPort(s.Metric["server_address"])
-		// Fall back to inferring the engine from a well-known peer port
-		// (5432→postgresql, 3306→mysql, …) only when the engine label is absent.
-		// Beyla emits no server.port on DB metrics, so this reads any port embedded
-		// in server_address; in practice db_system_name above covers ~all real traffic.
+		port := peerPort(s.Metric, s.Metric["server_address"])
+		// Gate on positive DB evidence. The peer port is the reliable discriminator:
+		// a real DB dependency talks a DB port (5432/3306/…), so when a port is known
+		// but is NOT a DB port, this is a Beyla misdetection of an HTTP/gRPC peer —
+		// drop it regardless of any (possibly bogus) engine label. When no port is
+		// available (older data without server_port), fall back to trusting a
+		// recognised engine so genuine DBs on non-standard ports still surface.
+		if port != "" {
+			if !isDatabasePort(port) {
+				continue
+			}
+		} else if !isKnownDBEngine(system) {
+			continue
+		}
+		// Infer the engine from a well-known DB peer port (5432→postgresql,
+		// 3306→mysql, …) when the engine label is absent.
 		if system == "" {
-			if sys, ok := wellKnownPorts[portOf(s.Metric["server_address"])]; ok {
+			if sys, ok := wellKnownPorts[port]; ok {
 				if _, isDB := databaseSystems[sys]; isDB {
 					system = sys
 				}
