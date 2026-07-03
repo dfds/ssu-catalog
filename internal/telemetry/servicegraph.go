@@ -80,6 +80,7 @@ func (o *Overlayer) Apply(ctx context.Context, apps []model.ApplicationEntry) []
 	edges := newEdgeSet()
 	o.applyServiceGraph(ctx, res, appByKey, edges)
 	o.applyHTTPClient(ctx, res, appByKey, edges)
+	o.applyDatabaseMetrics(ctx, res, appByKey, edges)
 	o.applyMessagingMetrics(ctx, res, appByKey, edges)
 
 	return edges.list
@@ -219,6 +220,74 @@ func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey
 			case kindKafka:
 				attachKafka(app, dst.Service, "", originMetrics)
 			}
+		}
+	}
+}
+
+// applyDatabaseMetrics attaches DB usage from Beyla's per-service db_client metric.
+// Beyla is eBPF-only: it has the peer server_address (an RDS endpoint, a VPC IP, a
+// public IP) and a db_system engine label, but exposes NO server_port for these
+// series. Most of these databases are EXTERNAL (RDS/managed), so we do NOT gate on
+// in-cluster-ness; and Beyla's eBPF SQL autodetection can misfire on opaque TLS
+// egress (it has stamped one public peer as BOTH mysql and postgresql), so the
+// engine label is imperfect. We attach broadly here — any series with an engine or
+// a resolvable host — and keep phantom-filtering as a separate, evidence-based
+// concern rather than dropping real RDS databases with an over-eager gate.
+func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
+	query := fmt.Sprintf(
+		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, db_system_name, db_system, db_name, server_address, server_port) (rate(db_client_operation_duration_seconds_count%s[%s]))`,
+		o.clusterMatcher(), o.window(),
+	)
+	samples, err := o.client.InstantQuery(ctx, query)
+	if err != nil {
+		o.queryFailed("db", err)
+		return
+	}
+	for _, s := range samples {
+		// db.system.name is the current OTel semconv label; db_system is the legacy
+		// name. Read both so a semconv rename doesn't silently blank the engine.
+		system := firstNonEmpty(s.Metric["db_system_name"], s.Metric["db_system"])
+		dbName := s.Metric["db_name"]
+		host := stripPort(s.Metric["server_address"])
+		port := peerPort(s.Metric, s.Metric["server_address"])
+		// Infer the engine from a well-known DB peer port (5432→postgresql, …) on the
+		// rare series that carries one, when the engine label is absent.
+		if system == "" {
+			if sys, ok := wellKnownPorts[port]; ok {
+				if _, isDB := databaseSystems[sys]; isDB {
+					system = sys
+				}
+			}
+		}
+		// Make a public-IP peer readable via reverse DNS (e.g. an RDS endpoint). A
+		// private/infra peer with no logical name and no detected engine is
+		// unattributable noise — drop only that, not real DBs behind private VPC IPs.
+		resolved, keep := o.externalHost(ctx, host)
+		if keep {
+			host = resolved
+		} else if dbName == "" && system == "" {
+			continue
+		}
+		// Identify the instance by its logical db_name when instrumented, else by the
+		// peer host; point the edge at the concrete host when we have one.
+		name := firstNonEmpty(dbName, host)
+		target := firstNonEmpty(host, system)
+		if target == "" {
+			continue
+		}
+		src := res.resolveClient(s.Metric)
+		edges.add(model.DependencyEdge{
+			Source:  src,
+			Target:  externalNode(target),
+			Type:    kindDatabase,
+			Origin:  originMetrics,
+			Details: dbName,
+		})
+		if src.External {
+			continue
+		}
+		if app := appByKey[src.Namespace+"/"+src.Service]; app != nil {
+			attachDatabaseNamed(app, system, name, originMetrics)
 		}
 	}
 }

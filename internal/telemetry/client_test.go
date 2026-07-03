@@ -418,20 +418,69 @@ func TestApply_HTTPClient_PublicIPReverseResolves(t *testing.T) {
 	}
 }
 
-func TestApply_DBClient_MetricIgnored(t *testing.T) {
-	// Beyla's db_client metric is NOT consumed: its eBPF protocol autodetection
-	// fabricates db.system (it stamped one real peer as BOTH mysql and postgresql)
-	// and never exposes a peer port, so the metric carries no trustworthy DB signal.
-	// Feeding it — including the exact dual-engine bug — must attach no database.
+func TestApply_DBClient_AttachesExternalDatabase(t *testing.T) {
+	// Most databases here are EXTERNAL (RDS). Beyla's db_client metric gives the peer
+	// address + engine but no port, so we attach broadly: a public RDS IP is reverse-
+	// resolved to its endpoint name and the engine label is recorded as the type.
 	stub := &stubClient{byQuery: map[string][]Sample{
 		"db_client_operation_duration_seconds_count": {
 			{Metric: map[string]string{
 				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
 				"server_address": "203.0.113.55", "db_system_name": "postgresql",
 			}},
+		},
+	}}
+	o := overlayerWith(stub)
+	o.lookupAddr = func(_ context.Context, ip string) ([]string, error) {
+		if ip == "203.0.113.55" {
+			return []string{"orders.abc123.eu-west-1.rds.example.com."}, nil
+		}
+		return nil, nil
+	}
+	apps := sampleApps()
+	edges := o.Apply(context.Background(), apps)
+
+	api := findApp(apps, "api")
+	if len(api.Databases) != 1 || api.Databases[0].System != "postgresql" ||
+		api.Databases[0].Name != "orders.abc123.eu-west-1.rds.example.com" {
+		t.Fatalf("expected postgresql RDS database, got %+v", api.Databases)
+	}
+	if len(edges) != 1 || edges[0].Type != kindDatabase {
+		t.Errorf("expected one database edge, got %+v", edges)
+	}
+}
+
+func TestApply_DBClient_KeepsPrivateVPCDatabase(t *testing.T) {
+	// A VPC-private RDS IP with an engine is a real database the cluster routes to;
+	// it is kept (as the bare IP, since reverse DNS is skipped for private space).
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"db_client_operation_duration_seconds_count": {
 			{Metric: map[string]string{
 				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
-				"server_address": "203.0.113.55", "db_system_name": "mysql",
+				"server_address": "10.0.0.42", "db_system_name": "mysql",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	edges := overlayerWith(stub).Apply(context.Background(), apps)
+
+	api := findApp(apps, "api")
+	if len(api.Databases) != 1 || api.Databases[0].System != "mysql" || api.Databases[0].Name != "10.0.0.42" {
+		t.Fatalf("expected mysql DB on the private VPC IP, got %+v", api.Databases)
+	}
+	if len(edges) != 1 || edges[0].Type != kindDatabase {
+		t.Errorf("expected one database edge, got %+v", edges)
+	}
+}
+
+func TestApply_DBClient_DropsUnidentifiableNoise(t *testing.T) {
+	// A private/infra peer with NO engine and NO logical name is unattributable
+	// noise (a resolver/proxy socket Beyla misread), not a database — drop it.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"db_client_operation_duration_seconds_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "10.0.0.7",
 			}},
 		},
 	}}
@@ -439,10 +488,10 @@ func TestApply_DBClient_MetricIgnored(t *testing.T) {
 	edges := overlayerWith(stub).Apply(context.Background(), apps)
 
 	if api := findApp(apps, "api"); len(api.Databases) != 0 {
-		t.Fatalf("expected db_client metric ignored, got databases %+v", api.Databases)
+		t.Fatalf("expected no database for unidentifiable noise, got %+v", api.Databases)
 	}
 	if len(edges) != 0 {
-		t.Errorf("expected no edges from db_client metric, got %+v", edges)
+		t.Errorf("expected no edge for unidentifiable noise, got %+v", edges)
 	}
 }
 
