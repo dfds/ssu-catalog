@@ -80,7 +80,6 @@ func (o *Overlayer) Apply(ctx context.Context, apps []model.ApplicationEntry) []
 	edges := newEdgeSet()
 	o.applyServiceGraph(ctx, res, appByKey, edges)
 	o.applyHTTPClient(ctx, res, appByKey, edges)
-	o.applyDatabaseMetrics(ctx, res, appByKey, edges)
 	o.applyMessagingMetrics(ctx, res, appByKey, edges)
 
 	return edges.list
@@ -206,107 +205,20 @@ func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey
 		if app := appByKey[src.Namespace+"/"+src.Service]; app != nil {
 			switch kind {
 			case kindDatabase:
-				attachDatabase(app, dst.Service, originMetrics)
+				// Classify the engine from the peer PORT (5432→postgresql,
+				// 3306→mysql, …), never from Beyla's db.system label: its eBPF
+				// protocol autodetection fabricates that engine — it has stamped
+				// the very same peer as both mysql and postgresql. The port is the
+				// only trustworthy signal, so record it as the DB type and keep the
+				// host as the instance identity.
+				engine := wellKnownPorts[peerPort(s.Metric, addr)]
+				if engine == "" {
+					engine = dst.Service // resolve matched a bare engine name, not a port
+				}
+				attachDatabaseNamed(app, engine, host, originMetrics)
 			case kindKafka:
 				attachKafka(app, dst.Service, "", originMetrics)
 			}
-		}
-	}
-}
-
-// applyDatabaseMetrics supplements DB usage from per-service DB metrics. Beyla is
-// eBPF-only, so it rarely knows the logical db_system/db_name — but it always has
-// the peer server_address (e.g. an RDS endpoint) and server_port. Attribute the
-// caller via its k8s labels (the `service` label is the Beyla collector, not the
-// app), infer the engine from the peer port when db_system is absent, and fall
-// back to the (reverse-resolved) address as the database identity.
-//
-// Beyla's eBPF protocol autodetection misfires on opaque/encrypted egress (TLS,
-// gRPC/OTLP) and emits spurious db_client series for peers that are really
-// HTTP/gRPC APIs — so require POSITIVE evidence of a database before drawing a
-// DB edge: a well-known DB peer port, or (absent a port) a recognised engine.
-func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
-	query := fmt.Sprintf(
-		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, db_system_name, db_system, db_name, server_address, server_port) (rate(db_client_operation_duration_seconds_count%s[%s]))`,
-		o.clusterMatcher(), o.window(),
-	)
-	samples, err := o.client.InstantQuery(ctx, query)
-	if err != nil {
-		o.queryFailed("db", err)
-		return
-	}
-	for _, s := range samples {
-		// db.system.name is the current OTel semconv label; db_system is the legacy
-		// name. Beyla detects the engine from the wire protocol, so this is usually
-		// populated — read both so a semconv rename doesn't silently blank the engine.
-		system := firstNonEmpty(s.Metric["db_system_name"], s.Metric["db_system"])
-		dbName := s.Metric["db_name"]
-		host := stripPort(s.Metric["server_address"])
-		port := peerPort(s.Metric, s.Metric["server_address"])
-		// Gate on positive DB evidence. The peer port is the reliable discriminator:
-		// a real DB dependency talks a DB port (5432/3306/…), so when a port is known
-		// but is NOT a DB port, this is a Beyla misdetection of an HTTP/gRPC peer —
-		// drop it regardless of any (possibly bogus) engine label.
-		if port != "" {
-			if !isDatabasePort(port) {
-				continue
-			}
-		} else {
-			// No port to arbitrate on (Beyla exposes none for this series). Beyla's
-			// eBPF SQL autodetection misfires on opaque TLS egress and stamps a
-			// fabricated engine (even flipping between mysql/postgresql for one peer)
-			// on ordinary HTTPS/gRPC endpoints — and those are overwhelmingly bare
-			// PUBLIC IPs (SaaS APIs, third-party services). A genuine DB dependency
-			// here is an in-cluster peer: a logical service name or a private/RDS IP.
-			// So a public-IP "database" with no port is misdetection, not a real edge —
-			// drop it before trusting the engine label, which itself is only credible
-			// for an in-cluster peer with a recognised engine.
-			if isBareIP(host) && !isPrivateIP(host) {
-				continue
-			}
-			if !isKnownDBEngine(system) {
-				continue
-			}
-		}
-		// Infer the engine from a well-known DB peer port (5432→postgresql,
-		// 3306→mysql, …) when the engine label is absent.
-		if system == "" {
-			if sys, ok := wellKnownPorts[port]; ok {
-				if _, isDB := databaseSystems[sys]; isDB {
-					system = sys
-				}
-			}
-		}
-		// Make a public-IP peer readable via reverse DNS (e.g. an RDS endpoint).
-		// A private/infra peer (loopback DB proxy, in-cluster IP) with no logical
-		// name and no detected engine is unattributable noise — the "::1"/host-only
-		// phantoms — so drop it rather than surface a bare IP or a mangled ":".
-		resolved, keep := o.externalHost(ctx, host)
-		if keep {
-			host = resolved
-		} else if dbName == "" && system == "" {
-			continue
-		}
-		// Identify the instance by its logical db_name when instrumented, else by
-		// the peer host; point the edge at the concrete host when we have one.
-		name := firstNonEmpty(dbName, host)
-		target := firstNonEmpty(host, system)
-		if target == "" {
-			continue
-		}
-		src := res.resolveClient(s.Metric)
-		edges.add(model.DependencyEdge{
-			Source:  src,
-			Target:  externalNode(target),
-			Type:    kindDatabase,
-			Origin:  originMetrics,
-			Details: dbName,
-		})
-		if src.External {
-			continue
-		}
-		if app := appByKey[src.Namespace+"/"+src.Service]; app != nil {
-			attachDatabaseNamed(app, system, name, originMetrics)
 		}
 	}
 }

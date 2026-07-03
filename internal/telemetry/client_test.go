@@ -275,16 +275,22 @@ func TestServiceGraphQuery_ClusterScopedWithNamespaceLabels(t *testing.T) {
 }
 
 func TestApply_DatabaseMetricsSupplement(t *testing.T) {
+	// DB usage is supplemented from the http_client metric via the peer PORT: egress
+	// to 6379 is classified redis from the port alone (Beyla's db.system label, which
+	// its eBPF autodetection fabricates, is never consulted).
 	stub := &stubClient{byQuery: map[string][]Sample{
-		"db_client_operation_duration_seconds_count": {
-			{Metric: map[string]string{"service": "api.cap-a", "db_system": "redis", "db_name": "cache"}},
+		"http_client_request_body_size_bytes_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
+				"server_address": "cache.example.com", "server_port": "6379",
+			}},
 		},
 	}}
 	apps := sampleApps()
 	edges := overlayerWith(stub).Apply(context.Background(), apps)
 
 	api := findApp(apps, "api")
-	if len(api.Databases) != 1 || api.Databases[0].System != "redis" || api.Databases[0].Name != "cache" {
+	if len(api.Databases) != 1 || api.Databases[0].System != "redis" || api.Databases[0].Name != "cache.example.com" {
 		t.Fatalf("api db supplement wrong: %+v", api.Databases)
 	}
 	if api.Databases[0].Source != originMetrics {
@@ -317,13 +323,16 @@ func TestApply_QueryFailureDegradesGracefully(t *testing.T) {
 	stub := &stubClient{
 		errFor: map[string]bool{"traces_service_graph_request_total": true},
 		byQuery: map[string][]Sample{
-			"db_client_operation_duration_seconds_count": {
-				{Metric: map[string]string{"service": "api.cap-a", "db_system": "mysql"}},
+			"http_client_request_body_size_bytes_count": {
+				{Metric: map[string]string{
+					"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
+					"server_address": "db.example.com", "server_port": "3306",
+				}},
 			},
 		},
 	}
 	apps := sampleApps()
-	// Service-graph query fails, but the DB supplement still applies.
+	// Service-graph query fails, but the port-based DB supplement still applies.
 	edges := overlayerWith(stub).Apply(context.Background(), apps)
 	if len(edges) != 1 || edges[0].Type != kindDatabase {
 		t.Errorf("expected only the DB edge to survive, got %+v", edges)
@@ -371,110 +380,6 @@ func TestApply_HTTPClientResolvesExternalEgress(t *testing.T) {
 	}
 }
 
-func TestApply_DBClient_DropsPortlessEnginelessNoise(t *testing.T) {
-	// A db_client series with neither a peer port nor a recognised engine carries
-	// no positive evidence that the peer is a database — it is the shape Beyla's
-	// eBPF protocol autodetection produces when it misfires. Drop it rather than
-	// surface a bare address as a phantom database.
-	stub := &stubClient{byQuery: map[string][]Sample{
-		"db_client_operation_duration_seconds_count": {
-			{Metric: map[string]string{
-				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
-				"server_address": "198.51.100.20",
-			}},
-		},
-	}}
-	apps := sampleApps()
-	edges := overlayerWith(stub).Apply(context.Background(), apps)
-
-	if api := findApp(apps, "api"); len(api.Databases) != 0 {
-		t.Fatalf("expected no database attached for portless/engineless noise, got %+v", api.Databases)
-	}
-	if len(edges) != 0 {
-		t.Errorf("expected no database edge, got %+v", edges)
-	}
-}
-
-func TestApply_DBClient_DropsNonDBPortMisdetection(t *testing.T) {
-	// Beyla's eBPF protocol autodetection misfires on opaque/encrypted egress —
-	// TLS on 443, gRPC/OTLP on 4317 — emitting a db_client series (sometimes even
-	// with a bogus db_system_name) for a peer that is really an HTTP/gRPC API. The
-	// peer port is the reliable discriminator: a non-DB port means it is not a
-	// database, whatever the (guessed) engine label says.
-	stub := &stubClient{byQuery: map[string][]Sample{
-		"db_client_operation_duration_seconds_count": {
-			// HTTPS website misdetected as postgresql — port 443 in server_port.
-			{Metric: map[string]string{
-				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
-				"server_address": "site.example.com", "server_port": "443",
-				"db_system_name": "postgresql",
-			}},
-			// OTLP/gRPC collector misdetected — port 4317 embedded in the address.
-			{Metric: map[string]string{
-				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
-				"server_address": "otel-collector.example.com:4317",
-			}},
-		},
-	}}
-	apps := sampleApps()
-	edges := overlayerWith(stub).Apply(context.Background(), apps)
-
-	if api := findApp(apps, "api"); len(api.Databases) != 0 {
-		t.Fatalf("expected no database attached for non-DB-port peers, got %+v", api.Databases)
-	}
-	if len(edges) != 0 {
-		t.Errorf("expected no database edge for HTTP/gRPC peers, got %+v", edges)
-	}
-}
-
-func TestApply_DBClient_DropsPublicIPEngineNoise(t *testing.T) {
-	// Beyla exposes no server_port for db_client series, so a peer with a fabricated
-	// engine and no port would otherwise pass on the engine label alone. But when the
-	// peer is a bare PUBLIC IP it is opaque TLS egress (a SaaS/API endpoint) that Beyla
-	// misread as SQL — a real DB dependency here is an in-cluster peer (logical name or
-	// private IP). Drop the public-IP "database" despite its engine label.
-	stub := &stubClient{byQuery: map[string][]Sample{
-		"db_client_operation_duration_seconds_count": {
-			{Metric: map[string]string{
-				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
-				"server_address": "203.0.113.55", "db_system_name": "postgresql",
-			}},
-		},
-	}}
-	apps := sampleApps()
-	edges := overlayerWith(stub).Apply(context.Background(), apps)
-
-	if api := findApp(apps, "api"); len(api.Databases) != 0 {
-		t.Fatalf("expected no database attached for public-IP engine noise, got %+v", api.Databases)
-	}
-	if len(edges) != 0 {
-		t.Errorf("expected no database edge for public-IP peer, got %+v", edges)
-	}
-}
-
-func TestApply_DBClient_KeepsPrivateIPEngine(t *testing.T) {
-	// A private/RDS-space peer with a recognised engine and no port is a genuine
-	// in-cluster database dependency (Beyla emits no server_port for db_client), so
-	// the engine label is trusted for non-public peers.
-	stub := &stubClient{byQuery: map[string][]Sample{
-		"db_client_operation_duration_seconds_count": {
-			{Metric: map[string]string{
-				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
-				"server_address": "10.0.0.42", "db_system_name": "postgresql",
-			}},
-		},
-	}}
-	apps := sampleApps()
-	edges := overlayerWith(stub).Apply(context.Background(), apps)
-
-	if api := findApp(apps, "api"); len(api.Databases) != 1 {
-		t.Fatalf("expected one database attached for private-IP engine peer, got %+v", api.Databases)
-	}
-	if len(edges) != 1 {
-		t.Errorf("expected one database edge for private-IP peer, got %+v", edges)
-	}
-}
-
 func TestApply_HTTPClient_PublicIPReverseResolves(t *testing.T) {
 	// Public egress IPs are kept (unlike private/infra IPs); a PTR record makes
 	// them readable, and an unresolvable one still surfaces as the literal IP.
@@ -513,13 +418,42 @@ func TestApply_HTTPClient_PublicIPReverseResolves(t *testing.T) {
 	}
 }
 
-func TestApply_DBClient_PortInfersSystem(t *testing.T) {
-	// No db_system, but the peer port (5432) identifies the engine, and a PTR
-	// record names the RDS endpoint behind the IP.
+func TestApply_DBClient_MetricIgnored(t *testing.T) {
+	// Beyla's db_client metric is NOT consumed: its eBPF protocol autodetection
+	// fabricates db.system (it stamped one real peer as BOTH mysql and postgresql)
+	// and never exposes a peer port, so the metric carries no trustworthy DB signal.
+	// Feeding it — including the exact dual-engine bug — must attach no database.
 	stub := &stubClient{byQuery: map[string][]Sample{
 		"db_client_operation_duration_seconds_count": {
 			{Metric: map[string]string{
 				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "203.0.113.55", "db_system_name": "postgresql",
+			}},
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "203.0.113.55", "db_system_name": "mysql",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	edges := overlayerWith(stub).Apply(context.Background(), apps)
+
+	if api := findApp(apps, "api"); len(api.Databases) != 0 {
+		t.Fatalf("expected db_client metric ignored, got databases %+v", api.Databases)
+	}
+	if len(edges) != 0 {
+		t.Errorf("expected no edges from db_client metric, got %+v", edges)
+	}
+}
+
+func TestApply_HTTPClient_DBPortInfersEngine(t *testing.T) {
+	// DB detection is now purely port-based, off the http_client metric (the one that
+	// carries server_port). A peer on 5432 is classified postgresql from the PORT —
+	// never an engine label — and a PTR record names the endpoint behind the IP.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"http_client_request_body_size_bytes_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
 				"server_address": "198.51.100.20:5432",
 			}},
 		},
@@ -540,21 +474,21 @@ func TestApply_DBClient_PortInfersSystem(t *testing.T) {
 	}
 	db := api.Databases[0]
 	if db.System != "postgresql" || db.Name != "db.example.rds.example.com" {
-		t.Errorf("expected postgresql engine + PTR name, got %+v", db)
+		t.Errorf("expected postgresql engine (from port) + PTR name, got %+v", db)
 	}
-	if len(edges) != 1 || edges[0].Target.Service != "db.example.rds.example.com" {
+	if len(edges) != 1 || edges[0].Type != kindDatabase || edges[0].Target.Service != "db.example.rds.example.com" {
 		t.Errorf("expected edge to the resolved DB host, got %+v", edges)
 	}
 }
 
-func TestApply_DBClient_KeepsDBPortFromServerPortLabel(t *testing.T) {
+func TestApply_HTTPClient_DBPortFromServerPortLabel(t *testing.T) {
 	// The DB port arrives in the dedicated server_port label (revealed via Beyla's
-	// attributes.select). A well-known DB port is positive evidence, so the edge is
-	// kept and the engine inferred from the port when the label is absent.
+	// attributes.select). A well-known DB port is the sole positive signal, so the
+	// edge is a database and the engine is inferred from the port.
 	stub := &stubClient{byQuery: map[string][]Sample{
-		"db_client_operation_duration_seconds_count": {
+		"http_client_request_body_size_bytes_count": {
 			{Metric: map[string]string{
-				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
 				"server_address": "db.example.com", "server_port": "5432",
 			}},
 		},
