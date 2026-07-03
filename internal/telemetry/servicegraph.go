@@ -3,6 +3,9 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"net"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -43,6 +46,12 @@ type Overlayer struct {
 	lookback    time.Duration
 	queryErrors prometheus.Counter // nil-safe
 	logger      *zap.Logger
+
+	// lookupAddr resolves an IP to its PTR hostnames; nil defaults to a
+	// time-bounded DNS lookup. Overridable in tests to avoid real DNS.
+	lookupAddr func(ctx context.Context, ip string) ([]string, error)
+	ptrMu      sync.Mutex
+	ptrCache   map[string]string
 }
 
 // NewOverlayer builds an Overlayer. queryErrors may be nil (e.g. in tests).
@@ -149,8 +158,9 @@ func (o *Overlayer) applyServiceGraph(ctx context.Context, res *resolver, appByK
 // Beyla buckets un-resolvable egress under server="outgoing"; the HTTP client
 // metric instead carries the concrete server_address, so real dependencies on
 // AWS APIs, third-party HTTP services, etc. surface by name. In-cluster
-// destinations are left to the (richer) service-graph overlay, and bare IPs are
-// dropped as infra/mesh noise — DB hosts arrive via the DB metric instead.
+// destinations are left to the (richer) service-graph overlay; private/infra IPs
+// are dropped as mesh noise, while public IPs are kept and reverse-resolved to a
+// hostname when DNS has a PTR record.
 func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
 	query := fmt.Sprintf(
 		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, server_address) (rate(%s%s[%s]))`,
@@ -170,9 +180,9 @@ func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey
 		if src.External {
 			continue // can't attribute the caller to a known workload
 		}
-		host := stripPort(addr)
-		if isBareIP(host) {
-			continue // infra/mesh noise (kube API server, node IPs)
+		host, keep := o.externalHost(ctx, stripPort(addr))
+		if !keep {
+			continue // private/infra IP (kube API server, node/pod IPs)
 		}
 		dst, kind := res.resolve(host)
 		if !dst.External {
@@ -203,8 +213,9 @@ func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey
 // applyDatabaseMetrics supplements DB usage from per-service DB metrics. Beyla is
 // eBPF-only, so it rarely knows the logical db_system/db_name — but it always has
 // the peer server_address (e.g. an RDS endpoint). Attribute the caller via its
-// k8s labels (the `service` label is the Beyla collector, not the app) and fall
-// back to the address as the database identity when the system is unknown.
+// k8s labels (the `service` label is the Beyla collector, not the app), infer the
+// engine from the peer port when db_system is absent, and fall back to the
+// (reverse-resolved) address as the database identity.
 func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
 	query := fmt.Sprintf(
 		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, db_system, db_name, server_address) (rate(db_client_operation_duration_seconds_count%s[%s]))`,
@@ -217,13 +228,25 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 	}
 	for _, s := range samples {
 		system, dbName := s.Metric["db_system"], s.Metric["db_name"]
-		// DB identity: the logical system when instrumented, else the peer host.
-		target := system
-		attachName := dbName
-		if target == "" {
-			target = stripPort(s.Metric["server_address"])
-			attachName = target
+		host := stripPort(s.Metric["server_address"])
+		// Beyla eBPF rarely knows the logical db_system; infer the engine from a
+		// well-known peer port (5432→postgresql, 3306→mysql, …) when it doesn't.
+		if system == "" {
+			if sys, ok := wellKnownPorts[portOf(s.Metric["server_address"])]; ok {
+				if _, isDB := databaseSystems[sys]; isDB {
+					system = sys
+				}
+			}
 		}
+		// Make a public-IP peer readable via reverse DNS (e.g. an RDS endpoint);
+		// private/infra IPs fall through unchanged.
+		if resolved, keep := o.externalHost(ctx, host); keep {
+			host = resolved
+		}
+		// Identify the instance by its logical db_name when instrumented, else by
+		// the peer host; point the edge at the concrete host when we have one.
+		name := firstNonEmpty(dbName, host)
+		target := firstNonEmpty(host, system)
 		if target == "" {
 			continue
 		}
@@ -239,7 +262,7 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 			continue
 		}
 		if app := appByKey[src.Namespace+"/"+src.Service]; app != nil {
-			attachDatabaseNamed(app, system, attachName, originMetrics)
+			attachDatabaseNamed(app, system, name, originMetrics)
 		}
 	}
 }
@@ -291,6 +314,59 @@ func (o *Overlayer) window() string {
 		minutes = 1
 	}
 	return fmt.Sprintf("%dm", minutes)
+}
+
+// externalHost normalises a peer host for display. A hostname is returned as-is.
+// A bare IP is dropped (keep=false) when it is private/infra space, and otherwise
+// reverse-resolved to its PTR hostname — falling back to the literal public IP
+// when no PTR exists (so genuine external egress still surfaces, by name when we
+// can, by address when we can't).
+func (o *Overlayer) externalHost(ctx context.Context, host string) (string, bool) {
+	if host == "" || !isBareIP(host) {
+		return host, host != ""
+	}
+	if isPrivateIP(host) {
+		return "", false
+	}
+	if name := o.reverseLookup(ctx, host); name != "" {
+		return name, true
+	}
+	return host, true
+}
+
+// reverseLookup returns a PTR hostname for a public IP, or "" if none resolves.
+// Results (misses included) are cached for the Overlayer's lifetime and each
+// lookup is time-bounded, so a slow or blocked resolver can't stall a scan.
+func (o *Overlayer) reverseLookup(ctx context.Context, ip string) string {
+	o.ptrMu.Lock()
+	if o.ptrCache == nil {
+		o.ptrCache = map[string]string{}
+	} else if name, ok := o.ptrCache[ip]; ok {
+		o.ptrMu.Unlock()
+		return name
+	}
+	o.ptrMu.Unlock()
+
+	lookup := o.lookupAddr
+	if lookup == nil {
+		lookup = func(ctx context.Context, ip string) ([]string, error) {
+			ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			return net.DefaultResolver.LookupAddr(ctx, ip)
+		}
+	}
+	names, _ := lookup(ctx, ip)
+	name := ""
+	for _, n := range names {
+		if n = strings.TrimSuffix(strings.TrimSpace(n), "."); n != "" {
+			name = n
+			break
+		}
+	}
+	o.ptrMu.Lock()
+	o.ptrCache[ip] = name
+	o.ptrMu.Unlock()
+	return name
 }
 
 // messagingDirection maps an OTel messaging.operation value to produce/consume.

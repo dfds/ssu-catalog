@@ -162,10 +162,39 @@ func stripPort(addr string) string {
 	return addr
 }
 
-// isBareIP reports whether host is a raw IP literal (no hostname). Used to drop
-// infra/mesh noise (kube API server, node IPs) from the HTTP egress overlay.
+// isBareIP reports whether host is a raw IP literal (no hostname).
 func isBareIP(host string) bool {
 	return net.ParseIP(host) != nil
+}
+
+// isPrivateIP reports whether host is a non-routable IP — RFC1918 private space,
+// loopback, link-local, the unspecified address, or RFC6598 shared CGNAT space
+// (100.64.0.0/10, where EKS pod IPs commonly live). These are in-cluster/infra
+// peers (kube API server, node/pod IPs) with no useful external identity, so the
+// egress overlays drop them; public IPs are kept (and reverse-resolved) instead.
+func isPrivateIP(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
+	}
+	return false
+}
+
+// portOf returns the trailing numeric :port of a host[:port], or "" when absent.
+func portOf(addr string) string {
+	if i := strings.LastIndex(addr, ":"); i != -1 {
+		if _, err := strconv.Atoi(addr[i+1:]); err == nil {
+			return addr[i+1:]
+		}
+	}
+	return ""
 }
 
 // beylaEgressBucket reports whether a service-graph endpoint is Beyla's synthetic

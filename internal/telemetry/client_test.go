@@ -127,7 +127,10 @@ func sampleApps() []model.ApplicationEntry {
 }
 
 func overlayerWith(stub *stubClient) *Overlayer {
-	return NewOverlayer(stub, "hellman", time.Hour, nil, nil)
+	o := NewOverlayer(stub, "hellman", time.Hour, nil, nil)
+	// Never touch real DNS in tests; individual cases override with a stub map.
+	o.lookupAddr = func(context.Context, string) ([]string, error) { return nil, nil }
+	return o
 }
 
 func findApp(apps []model.ApplicationEntry, name string) *model.ApplicationEntry {
@@ -333,7 +336,7 @@ func TestApply_QueryFailureDegradesGracefully(t *testing.T) {
 func TestApply_HTTPClientResolvesExternalEgress(t *testing.T) {
 	// The HTTP client metric carries the concrete server_address the service
 	// graph collapses into "outgoing". Named external hosts resolve; in-cluster
-	// FQDNs are left to the service graph; bare IPs are dropped as infra noise.
+	// FQDNs are left to the service graph; private/infra IPs are dropped as noise.
 	stub := &stubClient{byQuery: map[string][]Sample{
 		"http_client_request_body_size_bytes_count": {
 			{Metric: map[string]string{
@@ -346,7 +349,7 @@ func TestApply_HTTPClientResolvesExternalEgress(t *testing.T) {
 			}},
 			{Metric: map[string]string{
 				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
-				"server_address": "192.0.2.1:443",
+				"server_address": "10.0.0.53:443", // private → dropped as infra noise
 			}},
 		},
 	}}
@@ -392,6 +395,112 @@ func TestApply_DBClientByServerAddress(t *testing.T) {
 	}
 	if len(edges) != 1 || edges[0].Type != kindDatabase || edges[0].Target.Service != "198.51.100.20" {
 		t.Errorf("expected 1 database edge to the DB host, got %+v", edges)
+	}
+}
+
+func TestApply_HTTPClient_PublicIPReverseResolves(t *testing.T) {
+	// Public egress IPs are kept (unlike private/infra IPs); a PTR record makes
+	// them readable, and an unresolvable one still surfaces as the literal IP.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"http_client_request_body_size_bytes_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
+				"server_address": "203.0.113.10:443", // has a PTR record below
+			}},
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
+				"server_address": "192.0.2.1:443", // public, but no PTR → kept as IP
+			}},
+		},
+	}}
+	o := overlayerWith(stub)
+	o.lookupAddr = func(_ context.Context, ip string) ([]string, error) {
+		if ip == "203.0.113.10" {
+			return []string{"api.gateway.example.com."}, nil
+		}
+		return nil, nil
+	}
+	edges := o.Apply(context.Background(), sampleApps())
+
+	targets := map[string]bool{}
+	for _, e := range edges {
+		if e.Target.External {
+			targets[e.Target.Service] = true
+		}
+	}
+	if !targets["api.gateway.example.com"] {
+		t.Errorf("expected reverse-resolved PTR hostname, got edges %+v", edges)
+	}
+	if !targets["192.0.2.1"] {
+		t.Errorf("expected unresolvable public IP kept as literal, got edges %+v", edges)
+	}
+}
+
+func TestApply_DBClient_PortInfersSystem(t *testing.T) {
+	// No db_system, but the peer port (5432) identifies the engine, and a PTR
+	// record names the RDS endpoint behind the IP.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"db_client_operation_duration_seconds_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "198.51.100.20:5432",
+			}},
+		},
+	}}
+	o := overlayerWith(stub)
+	o.lookupAddr = func(_ context.Context, ip string) ([]string, error) {
+		if ip == "198.51.100.20" {
+			return []string{"db.example.rds.example.com."}, nil
+		}
+		return nil, nil
+	}
+	apps := sampleApps()
+	edges := o.Apply(context.Background(), apps)
+
+	api := findApp(apps, "api")
+	if len(api.Databases) != 1 {
+		t.Fatalf("expected 1 database, got %+v", api.Databases)
+	}
+	db := api.Databases[0]
+	if db.System != "postgresql" || db.Name != "db.example.rds.example.com" {
+		t.Errorf("expected postgresql engine + PTR name, got %+v", db)
+	}
+	if len(edges) != 1 || edges[0].Target.Service != "db.example.rds.example.com" {
+		t.Errorf("expected edge to the resolved DB host, got %+v", edges)
+	}
+}
+
+func TestIsPrivateIP(t *testing.T) {
+	cases := map[string]bool{
+		"10.0.0.53":     true,  // RFC1918
+		"172.16.4.4":    true,  // RFC1918
+		"192.168.1.1":   true,  // RFC1918
+		"127.0.0.1":     true,  // loopback
+		"169.254.10.10": true,  // link-local
+		"100.100.0.1":   true,  // RFC6598 CGNAT
+		"203.0.113.10":  false, // public (TEST-NET-3)
+		"198.51.100.20": false, // public (TEST-NET-2)
+		"not-an-ip":     false, // hostname, not an IP literal
+	}
+	for host, want := range cases {
+		if got := isPrivateIP(host); got != want {
+			t.Errorf("isPrivateIP(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+func TestPortOf(t *testing.T) {
+	cases := map[string]string{
+		"198.51.100.20:5432":         "5432",
+		"api.example.com:443":        "443",
+		"198.51.100.20":              "",
+		"[2001:db8::1]:443":          "443",
+		"host-without-numeric:https": "",
+	}
+	for addr, want := range cases {
+		if got := portOf(addr); got != want {
+			t.Errorf("portOf(%q) = %q, want %q", addr, got, want)
+		}
 	}
 }
 
