@@ -63,6 +63,33 @@ var messagingSystems = map[string]struct{}{
 	"sqs": {}, "sns": {}, "eventhub": {}, "nservicebus": {},
 }
 
+// otelCollectorPeers holds the k8s service names of OpenTelemetry collectors.
+// Beyla's eBPF SQL autodetection fabricates a db_system (observed always
+// postgresql) on the long-lived gRPC/HTTP-2 stream a workload uses to EXPORT OTLP
+// telemetry to its collector: it misreads the connection-setup bytes as a SQL
+// handshake, so the phantom surfaces fleet-wide as a short burst then vanishes.
+// No real database is ever named this, so rejecting these peers in the DB overlay
+// has zero risk of dropping a genuine (even in-cluster) database.
+var otelCollectorPeers = map[string]struct{}{
+	"otel-collector":                  {},
+	"otel-collector-service":          {},
+	"opentelemetry-collector":         {},
+	"opentelemetry-collector-service": {},
+}
+
+// isOTLPCollectorPeer reports whether a db_client peer address is an OpenTelemetry
+// collector. It matches the first DNS label so it covers every address form Beyla
+// emits: the bare service name ("otel-collector-service") and the name.namespace
+// forms ("otel-collector-service.<ns>", with or without .svc.cluster.local).
+func isOTLPCollectorPeer(host string) bool {
+	label := host
+	if i := strings.IndexByte(host, '.'); i != -1 {
+		label = host[:i]
+	}
+	_, ok := otelCollectorPeers[strings.ToLower(label)]
+	return ok
+}
+
 // resolver maps unnormalized service-graph identifiers back to in-cluster
 // applications, degrading gracefully to External nodes. It deliberately does no
 // fuzzy suffix-stripping that would overstate confidence.

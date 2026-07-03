@@ -276,6 +276,14 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 		dbName := s.Metric["db_name"]
 		rawHost := stripPort(s.Metric["server_address"])
 		host := rawHost
+		// Reject OpenTelemetry collector peers. Beyla stamps a (fabricated, always
+		// postgresql) db_system on the gRPC/HTTP-2 stream a workload uses to EXPORT OTLP
+		// to its otel-collector-service, surfacing the collector as a phantom database
+		// fleet-wide. No real database is named this, so this is a zero-risk drop —
+		// unlike a blanket in-cluster gate, which would delete genuine in-cluster DBs.
+		if isOTLPCollectorPeer(rawHost) {
+			continue
+		}
 		port := peerPort(s.Metric, s.Metric["server_address"])
 		// Infer the engine from a well-known DB peer port (5432→postgresql, …) on the
 		// rare series that carries one, when the engine label is absent.

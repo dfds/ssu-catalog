@@ -553,6 +553,80 @@ func TestApply_DBClient_DropsPhantomWhenReachedOverHTTP(t *testing.T) {
 	}
 }
 
+func TestApply_DBClient_DropsOTLPCollectorPhantom(t *testing.T) {
+	// Beyla's eBPF SQL autodetection stamps a (fabricated, always postgresql)
+	// db_system on the gRPC/HTTP-2 stream a workload uses to EXPORT OTLP to its
+	// otel-collector-service — surfacing the collector as a phantom database
+	// fleet-wide. It must be dropped in EVERY address form Beyla emits (bare, and
+	// name.namespace with or without .svc.cluster.local), while a genuine RDS in the
+	// same batch survives. No real database is named this, so the drop is zero-risk.
+	const rdsIP = "203.0.113.90" // documentation range; real DB for `worker`
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"db_client_operation_duration_seconds_count": {
+			// api → collector, three phantom forms:
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "otel-collector-service", "db_system_name": "postgresql",
+			}},
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "otel-collector-service.monitoring-abc", "db_system_name": "postgresql",
+			}},
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "otel-collector-service.monitoring-abc.svc.cluster.local", "db_system_name": "postgresql",
+			}},
+			// worker → a genuine RDS that must NOT be dropped.
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-b", "k8s_deployment_name": "worker", "service": "beyla",
+				"server_address": rdsIP, "db_system_name": "postgresql",
+			}},
+		},
+	}}
+	o := overlayerWith(stub)
+	o.lookupAddr = func(_ context.Context, ip string) ([]string, error) {
+		if ip == rdsIP {
+			return []string{"orders.abc123.eu-west-1.rds.example.com."}, nil
+		}
+		return nil, nil
+	}
+	apps := sampleApps()
+	edges := o.Apply(context.Background(), apps)
+
+	if api := findApp(apps, "api"); len(api.Databases) != 0 {
+		t.Fatalf("all OTLP-collector phantoms should be dropped, got %+v", api.Databases)
+	}
+	worker := findApp(apps, "worker")
+	if len(worker.Databases) != 1 || worker.Databases[0].System != "postgresql" ||
+		worker.Databases[0].Name != "orders.abc123.eu-west-1.rds.example.com" {
+		t.Fatalf("real RDS should survive, got %+v", worker.Databases)
+	}
+	// Only the real DB draws an edge; the three phantoms draw none.
+	if len(edges) != 1 || edges[0].Type != kindDatabase {
+		t.Errorf("expected exactly the real DB edge, got %d: %+v", len(edges), edges)
+	}
+}
+
+func TestIsOTLPCollectorPeer(t *testing.T) {
+	cases := map[string]bool{
+		"otel-collector-service":                                  true,
+		"otel-collector-service.monitoring-abc":                   true,
+		"otel-collector-service.monitoring-abc.svc.cluster.local": true,
+		"otel-collector":                                          true,
+		"opentelemetry-collector":                                 true,
+		"OTEL-COLLECTOR-SERVICE":                                  true, // case-insensitive
+		"orders.abc123.eu-west-1.rds.example.com":                 false,
+		"collector-of-tolls":                                      false, // not an OTLP collector
+		"203.0.113.90":                                            false,
+		"":                                                        false,
+	}
+	for host, want := range cases {
+		if got := isOTLPCollectorPeer(host); got != want {
+			t.Errorf("isOTLPCollectorPeer(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
 func TestApply_HTTPClient_DBPortInfersEngine(t *testing.T) {
 	// DB detection is now purely port-based, off the http_client metric (the one that
 	// carries server_port). A peer on 5432 is classified postgresql from the PORT —
