@@ -152,14 +152,14 @@ func firstNonEmpty(vals ...string) string {
 }
 
 // stripPort removes a trailing :port from a host[:port], leaving bare hosts (and
-// values with a non-numeric suffix) untouched.
+// values with a non-numeric suffix) untouched. It is IPv6-aware: a bracketed
+// literal ("[::1]:5432" or "[::1]") yields the inner address, and a bare IPv6
+// literal (two or more colons, unbracketed — e.g. "::1") has no separable port
+// and is returned intact. Without this, LastIndex(":") on "::1" would strip the
+// final octet and leave ":" — a garbage host that surfaces as a phantom node.
 func stripPort(addr string) string {
-	if i := strings.LastIndex(addr, ":"); i != -1 {
-		if _, err := strconv.Atoi(addr[i+1:]); err == nil {
-			return addr[:i]
-		}
-	}
-	return addr
+	host, _ := splitHostPort(addr)
+	return host
 }
 
 // isBareIP reports whether host is a raw IP literal (no hostname).
@@ -188,13 +188,69 @@ func isPrivateIP(host string) bool {
 }
 
 // portOf returns the trailing numeric :port of a host[:port], or "" when absent.
+// Like stripPort it is IPv6-aware: a bare IPv6 literal has no port to return.
 func portOf(addr string) string {
+	_, port := splitHostPort(addr)
+	return port
+}
+
+// splitHostPort separates a host[:port] into (host, port), returning an empty
+// port when none is present. It handles three shapes:
+//   - bracketed IPv6, with or without a port: "[::1]:5432" / "[::1]"
+//   - bare IPv6 literals (2+ unbracketed colons, e.g. "::1"): no separable port
+//   - host:port / IPv4:port with a trailing numeric port
+//
+// A non-numeric trailing segment (e.g. ".svc.cluster.local") is treated as part
+// of the host, not a port.
+func splitHostPort(addr string) (host, port string) {
+	if addr == "" {
+		return "", ""
+	}
+	if strings.HasPrefix(addr, "[") {
+		if i := strings.LastIndex(addr, "]"); i != -1 {
+			host = addr[1:i]
+			if rest := addr[i+1:]; strings.HasPrefix(rest, ":") {
+				if _, err := strconv.Atoi(rest[1:]); err == nil {
+					port = rest[1:]
+				}
+			}
+			return host, port
+		}
+		return addr, ""
+	}
+	// Bare IPv6 literal — two or more colons and no port delimiter to strip.
+	if strings.Count(addr, ":") > 1 {
+		return addr, ""
+	}
 	if i := strings.LastIndex(addr, ":"); i != -1 {
 		if _, err := strconv.Atoi(addr[i+1:]); err == nil {
-			return addr[i+1:]
+			return addr[:i], addr[i+1:]
 		}
 	}
-	return ""
+	return addr, ""
+}
+
+// peerPort returns the destination port for a client-metric sample. Beyla emits
+// it in the dedicated server_port label (once revealed via attributes.select);
+// older data may instead have it embedded in server_address, so fall back to that.
+func peerPort(m map[string]string, addr string) string {
+	if p := m["server_port"]; p != "" {
+		return p
+	}
+	return portOf(addr)
+}
+
+// joinHostPort re-attaches a port to a host for classification, returning the bare
+// host when port is empty. IPv6 hosts are bracketed so splitHostPort can separate
+// them again ("[::1]:5432" rather than an ambiguous "::1:5432").
+func joinHostPort(host, port string) string {
+	if port == "" {
+		return host
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	return host + ":" + port
 }
 
 // beylaEgressBucket reports whether a service-graph endpoint is Beyla's synthetic
@@ -213,12 +269,7 @@ func (r *resolver) resolve(identifier string) (model.DependencyNode, string) {
 	}
 
 	// Drop a trailing :port, remembering it for bare-host classification.
-	host, port := id, ""
-	if i := strings.LastIndex(id, ":"); i != -1 {
-		if _, err := strconv.Atoi(id[i+1:]); err == nil {
-			host, port = id[:i], id[i+1:]
-		}
-	}
+	host, port := splitHostPort(id)
 
 	// 1. In-cluster DNS: {name}.{namespace}[.svc.cluster.local].
 	if name, ns, ok := splitClusterDNS(host); ok {

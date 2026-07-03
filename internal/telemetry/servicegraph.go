@@ -163,7 +163,7 @@ func (o *Overlayer) applyServiceGraph(ctx context.Context, res *resolver, appByK
 // hostname when DNS has a PTR record.
 func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
 	query := fmt.Sprintf(
-		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, server_address) (rate(%s%s[%s]))`,
+		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, server_address, server_port) (rate(%s%s[%s]))`,
 		httpClientMetric, o.clusterMatcher(), o.window(),
 	)
 	samples, err := o.client.InstantQuery(ctx, query)
@@ -184,7 +184,11 @@ func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey
 		if !keep {
 			continue // private/infra IP (kube API server, node/pod IPs)
 		}
-		dst, kind := res.resolve(host)
+		// Beyla emits the destination port in a SEPARATE server_port label (once
+		// revealed via attributes.select), not appended to server_address. Re-attach
+		// it so resolve can classify egress by well-known port (5432→postgresql,
+		// 9092→kafka, …); fall back to a port embedded in the address for older data.
+		dst, kind := res.resolve(joinHostPort(host, peerPort(s.Metric, addr)))
 		if !dst.External {
 			continue // in-cluster: the service graph already draws this, better
 		}
@@ -218,7 +222,7 @@ func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey
 // (reverse-resolved) address as the database identity.
 func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
 	query := fmt.Sprintf(
-		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, db_system, db_name, server_address) (rate(db_client_operation_duration_seconds_count%s[%s]))`,
+		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, db_system_name, db_system, db_name, server_address) (rate(db_client_operation_duration_seconds_count%s[%s]))`,
 		o.clusterMatcher(), o.window(),
 	)
 	samples, err := o.client.InstantQuery(ctx, query)
@@ -227,10 +231,16 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 		return
 	}
 	for _, s := range samples {
-		system, dbName := s.Metric["db_system"], s.Metric["db_name"]
+		// db.system.name is the current OTel semconv label; db_system is the legacy
+		// name. Beyla detects the engine from the wire protocol, so this is usually
+		// populated — read both so a semconv rename doesn't silently blank the engine.
+		system := firstNonEmpty(s.Metric["db_system_name"], s.Metric["db_system"])
+		dbName := s.Metric["db_name"]
 		host := stripPort(s.Metric["server_address"])
-		// Beyla eBPF rarely knows the logical db_system; infer the engine from a
-		// well-known peer port (5432→postgresql, 3306→mysql, …) when it doesn't.
+		// Fall back to inferring the engine from a well-known peer port
+		// (5432→postgresql, 3306→mysql, …) only when the engine label is absent.
+		// Beyla emits no server.port on DB metrics, so this reads any port embedded
+		// in server_address; in practice db_system_name above covers ~all real traffic.
 		if system == "" {
 			if sys, ok := wellKnownPorts[portOf(s.Metric["server_address"])]; ok {
 				if _, isDB := databaseSystems[sys]; isDB {
@@ -238,10 +248,15 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 				}
 			}
 		}
-		// Make a public-IP peer readable via reverse DNS (e.g. an RDS endpoint);
-		// private/infra IPs fall through unchanged.
-		if resolved, keep := o.externalHost(ctx, host); keep {
+		// Make a public-IP peer readable via reverse DNS (e.g. an RDS endpoint).
+		// A private/infra peer (loopback DB proxy, in-cluster IP) with no logical
+		// name and no detected engine is unattributable noise — the "::1"/host-only
+		// phantoms — so drop it rather than surface a bare IP or a mangled ":".
+		resolved, keep := o.externalHost(ctx, host)
+		if keep {
 			host = resolved
+		} else if dbName == "" && system == "" {
+			continue
 		}
 		// Identify the instance by its logical db_name when instrumented, else by
 		// the peer host; point the edge at the concrete host when we have one.
