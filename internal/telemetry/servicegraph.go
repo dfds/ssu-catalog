@@ -78,9 +78,10 @@ func (o *Overlayer) Apply(ctx context.Context, apps []model.ApplicationEntry) []
 	appByKey := indexApps(apps)
 
 	edges := newEdgeSet()
+	httpPeers := newClientPeers()
 	o.applyServiceGraph(ctx, res, appByKey, edges)
-	o.applyHTTPClient(ctx, res, appByKey, edges)
-	o.applyDatabaseMetrics(ctx, res, appByKey, edges)
+	o.applyHTTPClient(ctx, res, appByKey, edges, httpPeers)
+	o.applyDatabaseMetrics(ctx, res, appByKey, edges, httpPeers)
 	o.applyMessagingMetrics(ctx, res, appByKey, edges)
 
 	return edges.list
@@ -161,7 +162,7 @@ func (o *Overlayer) applyServiceGraph(ctx context.Context, res *resolver, appByK
 // destinations are left to the (richer) service-graph overlay; private/infra IPs
 // are dropped as mesh noise, while public IPs are kept and reverse-resolved to a
 // hostname when DNS has a PTR record.
-func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
+func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet, httpPeers *clientPeers) {
 	query := fmt.Sprintf(
 		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, server_address, server_port) (rate(%s%s[%s]))`,
 		httpClientMetric, o.clusterMatcher(), o.window(),
@@ -181,6 +182,13 @@ func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey
 			continue // can't attribute the caller to a known workload
 		}
 		host, keep := o.externalHost(ctx, stripPort(addr))
+		// Remember every host this workload talks to over HTTP — including the
+		// private and in-cluster peers we don't draw an egress edge for. The DB
+		// overlay consults this set to reject Beyla's phantom databases: a peer this
+		// workload reaches over HTTP/gRPC is not its database, however confidently
+		// eBPF stamped a db_system on the same TLS-on-443 stream. Recorded before the
+		// keep filter so a private-IP HTTP peer still shadows a phantom DB.
+		httpPeers.add(src.Namespace+"/"+src.Service, firstNonEmpty(host, stripPort(addr)))
 		if !keep {
 			continue // private/infra IP (kube API server, node/pod IPs)
 		}
@@ -233,7 +241,7 @@ func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey
 // engine label is imperfect. We attach broadly here — any series with an engine or
 // a resolvable host — and keep phantom-filtering as a separate, evidence-based
 // concern rather than dropping real RDS databases with an over-eager gate.
-func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
+func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet, httpPeers *clientPeers) {
 	query := fmt.Sprintf(
 		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, db_system_name, db_system, db_name, server_address, server_port) (rate(db_client_operation_duration_seconds_count%s[%s]))`,
 		o.clusterMatcher(), o.window(),
@@ -268,6 +276,18 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 		} else if dbName == "" && system == "" {
 			continue
 		}
+		src := res.resolveClient(s.Metric)
+		// Reject Beyla's phantom databases. If this same workload reaches this peer
+		// over HTTP (recorded by applyHTTPClient), the db_client series is eBPF
+		// misdetecting an HTTP/gRPC-on-443 stream as a DB call — Beyla even stamps a
+		// bogus db_system on it. The check is PER WORKLOAD, so a host that is a real
+		// database for one workload still attaches there while being dropped as a
+		// mere HTTP peer for another (e.g. an API hostname sharing an IP with an RDS
+		// box: real postgres for booking-auto-approval, phantom for a workload that
+		// only calls its HTTP API).
+		if !src.External && httpPeers.has(src.Namespace+"/"+src.Service, host) {
+			continue
+		}
 		// Identify the instance by its logical db_name when instrumented, else by the
 		// peer host; point the edge at the concrete host when we have one.
 		name := firstNonEmpty(dbName, host)
@@ -275,7 +295,6 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 		if target == "" {
 			continue
 		}
-		src := res.resolveClient(s.Metric)
 		edges.add(model.DependencyEdge{
 			Source:  src,
 			Target:  externalNode(target),
@@ -444,6 +463,40 @@ func attachKafka(app *model.ApplicationEntry, name, direction, source string) {
 		}
 	}
 	app.KafkaTopics = append(app.KafkaTopics, model.KafkaTopicRef{Name: name, Direction: direction, Source: source})
+}
+
+// --- HTTP peer index ---------------------------------------------------------
+
+// clientPeers records, per client workload ("namespace/service"), the set of
+// hosts it was observed talking to over HTTP. The DB overlay uses it to drop
+// Beyla's phantom databases — a peer reached over HTTP is not a database, so a
+// db_client series for the same (workload, host) is eBPF protocol misdetection.
+type clientPeers struct {
+	byApp map[string]map[string]struct{}
+}
+
+func newClientPeers() *clientPeers {
+	return &clientPeers{byApp: map[string]map[string]struct{}{}}
+}
+
+func (c *clientPeers) add(appKey, host string) {
+	if host == "" {
+		return
+	}
+	set := c.byApp[appKey]
+	if set == nil {
+		set = map[string]struct{}{}
+		c.byApp[appKey] = set
+	}
+	set[host] = struct{}{}
+}
+
+func (c *clientPeers) has(appKey, host string) bool {
+	if host == "" {
+		return false
+	}
+	_, ok := c.byApp[appKey][host]
+	return ok
 }
 
 // --- edge dedup --------------------------------------------------------------

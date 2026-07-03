@@ -495,6 +495,54 @@ func TestApply_DBClient_DropsUnidentifiableNoise(t *testing.T) {
 	}
 }
 
+func TestApply_DBClient_DropsPhantomWhenReachedOverHTTP(t *testing.T) {
+	// Beyla's eBPF misdetects an HTTP/gRPC-on-443 stream as a db_client call and
+	// stamps a bogus engine on it. The discriminator is PER WORKLOAD: `api` only
+	// talks to the shared host over HTTP, so its db_client→postgresql is a phantom
+	// and must be dropped — while `worker`, which reaches the SAME host only over
+	// the DB protocol, keeps its real postgres. (Mirrors an HTTP-API hostname that
+	// shares a public IP with an unrelated RDS box.)
+	const shared = "logisticsapi.example.com"
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"http_client_request_body_size_bytes_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
+				"server_address": shared, "server_port": "443",
+			}},
+		},
+		"db_client_operation_duration_seconds_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": shared, "db_system_name": "postgresql",
+			}},
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-b", "k8s_deployment_name": "worker", "service": "beyla",
+				"server_address": shared, "db_system_name": "postgresql",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	edges := overlayerWith(stub).Apply(context.Background(), apps)
+
+	if api := findApp(apps, "api"); len(api.Databases) != 0 {
+		t.Fatalf("phantom DB should be dropped for the HTTP caller, got %+v", api.Databases)
+	}
+	worker := findApp(apps, "worker")
+	if len(worker.Databases) != 1 || worker.Databases[0].System != "postgresql" ||
+		worker.Databases[0].Name != shared {
+		t.Fatalf("real postgres should survive for the DB-only caller, got %+v", worker.Databases)
+	}
+	// One service edge (api's HTTP egress) + one database edge (worker's real DB);
+	// the phantom draws no edge.
+	byType := map[string]int{}
+	for _, e := range edges {
+		byType[e.Type]++
+	}
+	if byType[kindDatabase] != 1 || byType[kindService] != 1 || len(edges) != 2 {
+		t.Errorf("expected 1 db + 1 service edge, got %d: %+v", len(edges), edges)
+	}
+}
+
 func TestApply_HTTPClient_DBPortInfersEngine(t *testing.T) {
 	// DB detection is now purely port-based, off the http_client metric (the one that
 	// carries server_port). A peer on 5432 is classified postgresql from the PORT —
