@@ -427,6 +427,54 @@ func TestApply_DBClient_DropsNonDBPortMisdetection(t *testing.T) {
 	}
 }
 
+func TestApply_DBClient_DropsPublicIPEngineNoise(t *testing.T) {
+	// Beyla exposes no server_port for db_client series, so a peer with a fabricated
+	// engine and no port would otherwise pass on the engine label alone. But when the
+	// peer is a bare PUBLIC IP it is opaque TLS egress (a SaaS/API endpoint) that Beyla
+	// misread as SQL — a real DB dependency here is an in-cluster peer (logical name or
+	// private IP). Drop the public-IP "database" despite its engine label.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"db_client_operation_duration_seconds_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "203.0.113.55", "db_system_name": "postgresql",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	edges := overlayerWith(stub).Apply(context.Background(), apps)
+
+	if api := findApp(apps, "api"); len(api.Databases) != 0 {
+		t.Fatalf("expected no database attached for public-IP engine noise, got %+v", api.Databases)
+	}
+	if len(edges) != 0 {
+		t.Errorf("expected no database edge for public-IP peer, got %+v", edges)
+	}
+}
+
+func TestApply_DBClient_KeepsPrivateIPEngine(t *testing.T) {
+	// A private/RDS-space peer with a recognised engine and no port is a genuine
+	// in-cluster database dependency (Beyla emits no server_port for db_client), so
+	// the engine label is trusted for non-public peers.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"db_client_operation_duration_seconds_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "10.0.0.42", "db_system_name": "postgresql",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	edges := overlayerWith(stub).Apply(context.Background(), apps)
+
+	if api := findApp(apps, "api"); len(api.Databases) != 1 {
+		t.Fatalf("expected one database attached for private-IP engine peer, got %+v", api.Databases)
+	}
+	if len(edges) != 1 {
+		t.Errorf("expected one database edge for private-IP peer, got %+v", edges)
+	}
+}
+
 func TestApply_HTTPClient_PublicIPReverseResolves(t *testing.T) {
 	// Public egress IPs are kept (unlike private/infra IPs); a PTR record makes
 	// them readable, and an unresolvable one still surfaces as the literal IP.

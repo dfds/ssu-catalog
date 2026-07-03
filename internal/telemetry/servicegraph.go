@@ -246,15 +246,27 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 		// Gate on positive DB evidence. The peer port is the reliable discriminator:
 		// a real DB dependency talks a DB port (5432/3306/…), so when a port is known
 		// but is NOT a DB port, this is a Beyla misdetection of an HTTP/gRPC peer —
-		// drop it regardless of any (possibly bogus) engine label. When no port is
-		// available (older data without server_port), fall back to trusting a
-		// recognised engine so genuine DBs on non-standard ports still surface.
+		// drop it regardless of any (possibly bogus) engine label.
 		if port != "" {
 			if !isDatabasePort(port) {
 				continue
 			}
-		} else if !isKnownDBEngine(system) {
-			continue
+		} else {
+			// No port to arbitrate on (Beyla exposes none for this series). Beyla's
+			// eBPF SQL autodetection misfires on opaque TLS egress and stamps a
+			// fabricated engine (even flipping between mysql/postgresql for one peer)
+			// on ordinary HTTPS/gRPC endpoints — and those are overwhelmingly bare
+			// PUBLIC IPs (SaaS APIs, third-party services). A genuine DB dependency
+			// here is an in-cluster peer: a logical service name or a private/RDS IP.
+			// So a public-IP "database" with no port is misdetection, not a real edge —
+			// drop it before trusting the engine label, which itself is only credible
+			// for an in-cluster peer with a recognised engine.
+			if isBareIP(host) && !isPrivateIP(host) {
+				continue
+			}
+			if !isKnownDBEngine(system) {
+				continue
+			}
 		}
 		// Infer the engine from a well-known DB peer port (5432→postgresql,
 		// 3306→mysql, …) when the engine label is absent.
