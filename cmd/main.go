@@ -102,7 +102,7 @@ func worker(
 			conf.Telemetry.MimirURL,
 			conf.Telemetry.BasicAuthUser,
 			conf.Telemetry.BasicAuthToken,
-			30*time.Second,
+			time.Duration(conf.Telemetry.TimeoutMs)*time.Millisecond,
 		)
 		overlayer = telemetry.NewOverlayer(
 			tClient,

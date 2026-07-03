@@ -65,6 +65,11 @@ type Config struct {
 		BasicAuthUser   string `json:"basicAuthUser"`
 		BasicAuthToken  string `json:"basicAuthToken"`
 		LookbackMinutes int    `json:"lookbackMinutes"`
+		// TimeoutMs bounds a single overlay query. The service-graph instant query
+		// scans every traces_service_graph_request_total series for the cluster, so
+		// on a busy Mimir/VictoriaMetrics it can be slow; the overlay degrades
+		// gracefully if it's exceeded (that cycle just has no overlay).
+		TimeoutMs int `json:"timeoutMs"`
 	} `json:"telemetry"`
 }
 
@@ -122,6 +127,9 @@ func Load() (Config, error) {
 	}
 	if conf.Telemetry.LookbackMinutes == 0 {
 		conf.Telemetry.LookbackMinutes = 60
+	}
+	if conf.Telemetry.TimeoutMs == 0 {
+		conf.Telemetry.TimeoutMs = 60000
 	}
 
 	if conf.OIDC.Enabled {

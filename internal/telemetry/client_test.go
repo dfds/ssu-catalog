@@ -330,6 +330,95 @@ func TestApply_QueryFailureDegradesGracefully(t *testing.T) {
 	}
 }
 
+func TestApply_HTTPClientResolvesExternalEgress(t *testing.T) {
+	// The HTTP client metric carries the concrete server_address the service
+	// graph collapses into "outgoing". Named external hosts resolve; in-cluster
+	// FQDNs are left to the service graph; bare IPs are dropped as infra noise.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"http_client_request_body_size_bytes_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
+				"server_address": "api.external.example.com:443",
+			}},
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
+				"server_address": "worker.cap-b.svc.cluster.local:8080",
+			}},
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
+				"server_address": "192.0.2.1:443",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	edges := overlayerWith(stub).Apply(context.Background(), apps)
+
+	if len(edges) != 1 {
+		t.Fatalf("expected exactly 1 external HTTP edge, got %d: %+v", len(edges), edges)
+	}
+	e := edges[0]
+	if !e.Target.External || e.Target.Service != "api.external.example.com" {
+		t.Errorf("expected external target, got %+v", e.Target)
+	}
+	if e.Source.External || e.Source.Service != "api" || e.Source.Namespace != "cap-a" {
+		t.Errorf("expected caller resolved to api/cap-a, got %+v", e.Source)
+	}
+	if e.Origin != originMetrics || e.Type != kindService {
+		t.Errorf("expected otel-metrics service edge, got %+v", e)
+	}
+}
+
+func TestApply_DBClientByServerAddress(t *testing.T) {
+	// Beyla eBPF often has no logical db_system/db_name — only the peer address
+	// (e.g. a managed-DB endpoint). Attribute the caller via its k8s labels (not
+	// the `service` label, which is the Beyla collector) and use the host as DB.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"db_client_operation_duration_seconds_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service": "beyla",
+				"server_address": "198.51.100.20",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	edges := overlayerWith(stub).Apply(context.Background(), apps)
+
+	api := findApp(apps, "api")
+	if len(api.Databases) != 1 || api.Databases[0].Name != "198.51.100.20" {
+		t.Fatalf("expected DB host attached as a database, got %+v", api.Databases)
+	}
+	if api.Databases[0].System != "" || api.Databases[0].Source != originMetrics {
+		t.Errorf("expected empty system + otel-metrics source, got %+v", api.Databases[0])
+	}
+	if len(edges) != 1 || edges[0].Type != kindDatabase || edges[0].Target.Service != "198.51.100.20" {
+		t.Errorf("expected 1 database edge to the DB host, got %+v", edges)
+	}
+}
+
+func TestApply_ServiceGraph_DropsEgressBucket(t *testing.T) {
+	// Beyla's synthetic "outgoing"/"incoming" buckets carry no real destination
+	// and are dropped — only the genuine in-cluster edge survives.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"traces_service_graph_request_total": {
+			{Metric: map[string]string{"client": "api", "client_k8s_namespace_name": "cap-a", "server": "outgoing"}},
+			{Metric: map[string]string{"client": "incoming", "server": "api", "server_k8s_namespace_name": "cap-a"}},
+			{Metric: map[string]string{
+				"client": "api", "client_k8s_namespace_name": "cap-a",
+				"server": "worker", "server_k8s_namespace_name": "cap-b",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	edges := overlayerWith(stub).Apply(context.Background(), apps)
+
+	if len(edges) != 1 {
+		t.Fatalf("expected only the real service edge, got %d: %+v", len(edges), edges)
+	}
+	if edges[0].Target.Service != "worker" || edges[0].Source.Service != "api" {
+		t.Errorf("expected api → worker edge, got %+v", edges[0])
+	}
+}
+
 func TestResolve_BarePortAndExternal(t *testing.T) {
 	r := newResolver("hellman", sampleApps())
 

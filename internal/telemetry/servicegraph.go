@@ -27,6 +27,13 @@ const (
 // OTel-instrumented apps, Tempo's metrics generator) stored in Mimir.
 const serviceGraphMetric = "traces_service_graph_request_total"
 
+// httpClientMetric is the OTel/Beyla HTTP client-request counter. Its
+// server_address label carries the concrete destination host (an AWS API, a
+// third-party endpoint, an in-cluster FQDN) that the service graph otherwise
+// collapses into a single "outgoing" bucket — so it is how we resolve real
+// external egress by name.
+const httpClientMetric = "http_client_request_body_size_bytes_count"
+
 // Overlayer queries Mimir and overlays a best-effort runtime dependency graph
 // onto the (already complete) K8s/GitOps/swagger catalog. Failures degrade
 // gracefully — the catalog is never invalidated by a missing/failed query.
@@ -63,6 +70,7 @@ func (o *Overlayer) Apply(ctx context.Context, apps []model.ApplicationEntry) []
 
 	edges := newEdgeSet()
 	o.applyServiceGraph(ctx, res, appByKey, edges)
+	o.applyHTTPClient(ctx, res, appByKey, edges)
 	o.applyDatabaseMetrics(ctx, res, appByKey, edges)
 	o.applyMessagingMetrics(ctx, res, appByKey, edges)
 
@@ -100,6 +108,12 @@ func (o *Overlayer) applyServiceGraph(ctx context.Context, res *resolver, appByK
 		if client == "" || server == "" {
 			continue
 		}
+		// Beyla buckets un-attributed egress/ingress under the synthetic names
+		// "outgoing"/"incoming" — no real destination, and now superseded by the
+		// server_address the HTTP-client overlay resolves. Drop them.
+		if beylaEgressBucket(client) || beylaEgressBucket(server) {
+			continue
+		}
 		src := res.resolveEndpointNode(client, s.Metric["client_k8s_namespace_name"])
 		dst, kind := res.resolveEndpoint(server, s.Metric["server_k8s_namespace_name"])
 
@@ -131,23 +145,92 @@ func (o *Overlayer) applyServiceGraph(ctx context.Context, res *resolver, appByK
 	}
 }
 
-// applyDatabaseMetrics supplements DB usage from per-service DB metrics.
+// applyHTTPClient resolves EXTERNAL egress the service graph can't attribute.
+// Beyla buckets un-resolvable egress under server="outgoing"; the HTTP client
+// metric instead carries the concrete server_address, so real dependencies on
+// AWS APIs, third-party HTTP services, etc. surface by name. In-cluster
+// destinations are left to the (richer) service-graph overlay, and bare IPs are
+// dropped as infra/mesh noise — DB hosts arrive via the DB metric instead.
+func (o *Overlayer) applyHTTPClient(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
+	query := fmt.Sprintf(
+		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, server_address) (rate(%s%s[%s]))`,
+		httpClientMetric, o.clusterMatcher(), o.window(),
+	)
+	samples, err := o.client.InstantQuery(ctx, query)
+	if err != nil {
+		o.queryFailed("http_client", err)
+		return
+	}
+	for _, s := range samples {
+		addr := s.Metric["server_address"]
+		if addr == "" {
+			continue
+		}
+		src := res.resolveClient(s.Metric)
+		if src.External {
+			continue // can't attribute the caller to a known workload
+		}
+		host := stripPort(addr)
+		if isBareIP(host) {
+			continue // infra/mesh noise (kube API server, node IPs)
+		}
+		dst, kind := res.resolve(host)
+		if !dst.External {
+			continue // in-cluster: the service graph already draws this, better
+		}
+		edgeType := kind
+		if kind == kindExternal {
+			edgeType = kindService
+		}
+		edges.add(model.DependencyEdge{
+			Source:  src,
+			Target:  dst,
+			Type:    edgeType,
+			Origin:  originMetrics,
+			Details: fmt.Sprintf("%s → %s", src.Service, host),
+		})
+		if app := appByKey[src.Namespace+"/"+src.Service]; app != nil {
+			switch kind {
+			case kindDatabase:
+				attachDatabase(app, dst.Service, originMetrics)
+			case kindKafka:
+				attachKafka(app, dst.Service, "", originMetrics)
+			}
+		}
+	}
+}
+
+// applyDatabaseMetrics supplements DB usage from per-service DB metrics. Beyla is
+// eBPF-only, so it rarely knows the logical db_system/db_name — but it always has
+// the peer server_address (e.g. an RDS endpoint). Attribute the caller via its
+// k8s labels (the `service` label is the Beyla collector, not the app) and fall
+// back to the address as the database identity when the system is unknown.
 func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
-	query := fmt.Sprintf(`count by (service, k8s_namespace_name, db_system, db_name) (rate(db_client_operation_duration_seconds_count%s[%s]))`, o.clusterMatcher(), o.window())
+	query := fmt.Sprintf(
+		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, db_system, db_name, server_address) (rate(db_client_operation_duration_seconds_count%s[%s]))`,
+		o.clusterMatcher(), o.window(),
+	)
 	samples, err := o.client.InstantQuery(ctx, query)
 	if err != nil {
 		o.queryFailed("db", err)
 		return
 	}
 	for _, s := range samples {
-		service, system, dbName := s.Metric["service"], s.Metric["db_system"], s.Metric["db_name"]
-		if service == "" || system == "" {
+		system, dbName := s.Metric["db_system"], s.Metric["db_name"]
+		// DB identity: the logical system when instrumented, else the peer host.
+		target := system
+		attachName := dbName
+		if target == "" {
+			target = stripPort(s.Metric["server_address"])
+			attachName = target
+		}
+		if target == "" {
 			continue
 		}
-		src := res.resolveEndpointNode(service, s.Metric["k8s_namespace_name"])
+		src := res.resolveClient(s.Metric)
 		edges.add(model.DependencyEdge{
 			Source:  src,
-			Target:  externalNode(system),
+			Target:  externalNode(target),
 			Type:    kindDatabase,
 			Origin:  originMetrics,
 			Details: dbName,
@@ -156,7 +239,7 @@ func (o *Overlayer) applyDatabaseMetrics(ctx context.Context, res *resolver, app
 			continue
 		}
 		if app := appByKey[src.Namespace+"/"+src.Service]; app != nil {
-			attachDatabaseNamed(app, system, dbName, originMetrics)
+			attachDatabaseNamed(app, system, attachName, originMetrics)
 		}
 	}
 }
@@ -237,7 +320,9 @@ func attachDatabase(app *model.ApplicationEntry, system, source string) {
 }
 
 func attachDatabaseNamed(app *model.ApplicationEntry, system, name, source string) {
-	if system == "" {
+	// Need at least one identifier: the logical system (OTel) or the peer host
+	// (Beyla eBPF, which sees the address but not the db_system).
+	if system == "" && name == "" {
 		return
 	}
 	for _, db := range app.Databases {

@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"net"
 	"strconv"
 	"strings"
 
@@ -120,6 +121,59 @@ func (r *resolver) resolveEndpoint(name, k8sNamespace string) (model.DependencyN
 func (r *resolver) resolveEndpointNode(name, k8sNamespace string) model.DependencyNode {
 	node, _ := r.resolveEndpoint(name, k8sNamespace)
 	return node
+}
+
+// resolveClient resolves the source workload of an OTel/Beyla *_client_* metric.
+// Beyla tags the instrumented workload with k8s_deployment_name +
+// k8s_namespace_name (and service_name = the OTel service.name); Tempo/OTLP
+// series may instead carry only `service` in name.namespace form. Prefer the
+// authoritative k8s labels, then fall back to `service`.
+func (r *resolver) resolveClient(m map[string]string) model.DependencyNode {
+	ns := m["k8s_namespace_name"]
+	name := firstNonEmpty(
+		m["k8s_deployment_name"],
+		m["k8s_statefulset_name"],
+		m["k8s_daemonset_name"],
+		m["service_name"],
+	)
+	if name != "" {
+		return r.resolveEndpointNode(name, ns)
+	}
+	return r.resolveEndpointNode(m["service"], ns)
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// stripPort removes a trailing :port from a host[:port], leaving bare hosts (and
+// values with a non-numeric suffix) untouched.
+func stripPort(addr string) string {
+	if i := strings.LastIndex(addr, ":"); i != -1 {
+		if _, err := strconv.Atoi(addr[i+1:]); err == nil {
+			return addr[:i]
+		}
+	}
+	return addr
+}
+
+// isBareIP reports whether host is a raw IP literal (no hostname). Used to drop
+// infra/mesh noise (kube API server, node IPs) from the HTTP egress overlay.
+func isBareIP(host string) bool {
+	return net.ParseIP(host) != nil
+}
+
+// beylaEgressBucket reports whether a service-graph endpoint is Beyla's synthetic
+// catch-all for un-attributed egress/ingress ("outgoing"/"incoming"). These carry
+// no real destination, so they are dropped in favour of the resolved
+// server_address the HTTP-client overlay provides.
+func beylaEgressBucket(name string) bool {
+	return name == "outgoing" || name == "incoming"
 }
 
 // resolveTarget resolves an identifier and classifies what kind of target it is.
