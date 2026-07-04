@@ -91,6 +91,7 @@ func (o *Overlayer) Apply(ctx context.Context, apps []model.ApplicationEntry) []
 	o.applyHTTPClient(ctx, res, appByKey, edges, httpPeers)
 	o.applyDatabaseMetrics(ctx, res, appByKey, edges, httpPeers)
 	o.applyMessagingMetrics(ctx, res, appByKey, edges)
+	o.applyRuntimeMetrics(ctx, res, appByKey)
 
 	return edges.list
 }
@@ -483,6 +484,49 @@ func (o *Overlayer) messagingSelector() string {
 		return `{messaging_system="kafka"}`
 	}
 	return fmt.Sprintf(`{messaging_system="kafka",cluster=%q}`, o.cluster)
+}
+
+// targetInfoMetric is the OTel resource metric Beyla emits per instrumented
+// workload. Its telemetry_sdk_language label carries the eBPF-detected runtime;
+// "generic" means Beyla could not fingerprint a language and is treated as "not
+// detected".
+const targetInfoMetric = "target_info"
+
+// applyRuntimeMetrics attaches Beyla's detected runtime/language to each workload
+// from target_info's telemetry_sdk_language. Best-effort: only workloads Beyla
+// instruments appear, and unfingerprintable ones report "generic" (dropped here).
+// No dependency edge is emitted — runtime is a workload attribute, not a relation.
+//
+// Windowed via count_over_time, NOT rate: target_info is a constant-1 info gauge
+// (rate would be 0), and windowing over the lookback includes every series active
+// at any point, avoiding the per-pod staleness gaps documented on serviceGraphQuery.
+// count by (...) collapses target_info's high-cardinality pod labels to one row per
+// (workload, language). Joins on the k8s labels via resolveClient, same as the
+// db/messaging overlays — the scrape `service` label (="beyla") is never consulted
+// because k8s_deployment_name/service_name are always populated on target_info.
+func (o *Overlayer) applyRuntimeMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry) {
+	query := fmt.Sprintf(
+		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, telemetry_sdk_language) (count_over_time(%s%s[%s]))`,
+		targetInfoMetric, o.clusterMatcher(), o.window(),
+	)
+	samples, err := o.client.InstantQuery(ctx, query)
+	if err != nil {
+		o.queryFailed("runtime", err)
+		return
+	}
+	for _, s := range samples {
+		lang := s.Metric["telemetry_sdk_language"]
+		if lang == "" || lang == "generic" {
+			continue // Beyla couldn't fingerprint a runtime — treat as undetected
+		}
+		src := res.resolveClient(s.Metric)
+		if src.External {
+			continue
+		}
+		if app := appByKey[src.Namespace+"/"+src.Service]; app != nil && app.Runtime == "" {
+			app.Runtime = lang // first detected wins
+		}
+	}
 }
 
 func (o *Overlayer) queryFailed(name string, err error) {

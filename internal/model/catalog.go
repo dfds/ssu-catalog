@@ -66,6 +66,11 @@ type ApplicationEntry struct {
 	KafkaTopics []KafkaTopicRef `json:"kafkaTopics"`
 	Databases   []DatabaseRef   `json:"databases"`
 
+	// Runtime is Beyla's detected language for the workload ("go", "dotnet",
+	// "java", ...), from target_info's telemetry_sdk_language. Empty when
+	// undetected/"generic".
+	Runtime string `json:"runtime"`
+
 	Labels      map[string]string `json:"labels"`
 	Annotations map[string]string `json:"annotations"`
 }

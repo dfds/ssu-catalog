@@ -329,6 +329,34 @@ func TestApply_MessagingMetricsSupplement(t *testing.T) {
 	}
 }
 
+func TestApply_RuntimeMetricsSupplement(t *testing.T) {
+	// Beyla's target_info carries the detected runtime in telemetry_sdk_language
+	// alongside the workload's k8s labels; resolution joins via resolveClient. A
+	// "generic" value means Beyla could not fingerprint the language and must be
+	// treated as undetected (left empty), never surfaced.
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"target_info": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
+				"telemetry_sdk_language": "dotnet",
+			}},
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-b", "k8s_deployment_name": "worker", "service_name": "worker",
+				"telemetry_sdk_language": "generic",
+			}},
+		},
+	}}
+	apps := sampleApps()
+	overlayerWith(stub).Apply(context.Background(), apps)
+
+	if api := findApp(apps, "api"); api.Runtime != "dotnet" {
+		t.Errorf("expected api runtime dotnet, got %q", api.Runtime)
+	}
+	if worker := findApp(apps, "worker"); worker.Runtime != "" {
+		t.Errorf("expected generic to be dropped (empty runtime), got %q", worker.Runtime)
+	}
+}
+
 func TestApply_QueryFailureDegradesGracefully(t *testing.T) {
 	stub := &stubClient{
 		errFor: map[string]bool{"traces_service_graph_request_total": true},
