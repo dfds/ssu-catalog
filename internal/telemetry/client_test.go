@@ -263,6 +263,10 @@ func TestServiceGraphQuery_ClusterScopedWithNamespaceLabels(t *testing.T) {
 		`cluster="hellman"`,
 		"client_k8s_namespace_name",
 		"server_k8s_namespace_name",
+		// Windowed, not instant: a periodic prober's bursty edges must survive a
+		// scan that lands between bursts (see serviceGraphQuery).
+		"count_over_time(",
+		"[60m]",
 	} {
 		if !contains(q, want) {
 			t.Errorf("service-graph query missing %q: %s", want, q)
@@ -302,9 +306,15 @@ func TestApply_DatabaseMetricsSupplement(t *testing.T) {
 }
 
 func TestApply_MessagingMetricsSupplement(t *testing.T) {
+	// Beyla emits the CONSUME metric (messaging_process_duration_seconds_count)
+	// with the bare workload labels + topic — never messaging.operation or a
+	// name.namespace service; resolution joins on the k8s labels via resolveClient.
 	stub := &stubClient{byQuery: map[string][]Sample{
-		"messaging_client_operation_duration_seconds_count": {
-			{Metric: map[string]string{"service": "worker.cap-b", "messaging_destination_name": "orders", "messaging_operation": "receive"}},
+		"messaging_process_duration_seconds_count": {
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-b", "k8s_deployment_name": "worker", "service_name": "worker",
+				"messaging_system": "kafka", "messaging_destination_name": "orders",
+			}},
 		},
 	}}
 	apps := sampleApps()

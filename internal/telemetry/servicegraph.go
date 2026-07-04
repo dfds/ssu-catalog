@@ -99,9 +99,22 @@ func (o *Overlayer) Apply(ctx context.Context, apps []model.ApplicationEntry) []
 // Beyla attaches to each side, so resolveEndpoint can join on (namespace, name)
 // instead of parsing the bare service.name. Cluster-scoped: without it, same-name
 // workloads collide across the fleet (namespace+name is only unique per cluster).
+//
+// Windowed over the lookback via count_over_time, NOT an instant snapshot. The
+// service-graph counter is scraped per-series, and a plain instant query only
+// returns series with a sample inside Prometheus's ~5m staleness window. Edges
+// from CONTINUOUS callers (scrapers, meshes) always survive that, but edges from
+// PERIODIC callers do not: ssu-catalog probes each workload on an interval, so its
+// service-graph series appear in bursts with multi-minute gaps and are stale —
+// hence dropped — whenever a scan lands between bursts. count_over_time(...[window])
+// instead includes every series active at ANY point in the lookback, so a periodic
+// prober's edges show as reliably as a continuous caller's. This mirrors the
+// windowing the db_client/http_client/messaging overlays already use. The value is
+// irrelevant here (applyServiceGraph reads only the label set), so a bare
+// count_over_time is enough.
 func (o *Overlayer) serviceGraphQuery() string {
-	return fmt.Sprintf(`count by (client, server, client_k8s_namespace_name, server_k8s_namespace_name) (%s%s)`,
-		serviceGraphMetric, o.clusterMatcher())
+	return fmt.Sprintf(`count by (client, server, client_k8s_namespace_name, server_k8s_namespace_name) (count_over_time(%s%s[%s]))`,
+		serviceGraphMetric, o.clusterMatcher(), o.window())
 }
 
 // clusterMatcher renders the PromQL label matcher scoping a query to this
@@ -415,36 +428,61 @@ func engineWinners(res *resolver, samples []Sample) map[string]map[string]bool {
 	return winners
 }
 
-// applyMessagingMetrics supplements Kafka/messaging usage from per-service
-// messaging metrics (best-effort; authoritative topics come from SSU's registry).
+// messagingProcessMetric is Beyla's Kafka CONSUME counter. OTel semconv split
+// messaging into messaging.publish.duration (produce) and
+// messaging.process.duration (consume); in this Beyla build only the process
+// (consume) side carries data — the publish series are empty fleet-wide — so every
+// edge derived here is a consume edge, and a produce edge is underivable from this
+// source. Beyla labels it with messaging_system (kafka), messaging_destination_name
+// (the topic) and its usual k8s decoration (k8s_deployment_name, k8s_namespace_name).
+const messagingProcessMetric = "messaging_process_duration_seconds_count"
+
+// applyMessagingMetrics supplements Kafka usage from Beyla's per-workload consume
+// metric. Best-effort SUPPLEMENT only: authoritative topics come from SSU's
+// registry, and Beyla sees a workload's Kafka traffic only when it can hook that
+// client library and decrypt the stream, so this covers a subset of consumers and
+// never yields a complete Kafka graph. Joins on the k8s labels via resolveClient
+// (the workload, not the bare service.name). Direction is always "consume": Beyla
+// emits no publish series here.
 func (o *Overlayer) applyMessagingMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry, edges *edgeSet) {
-	query := fmt.Sprintf(`count by (service, k8s_namespace_name, messaging_destination_name, messaging_operation) (rate(messaging_client_operation_duration_seconds_count%s[%s]))`, o.clusterMatcher(), o.window())
+	query := fmt.Sprintf(
+		`count by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, messaging_destination_name) (rate(%s%s[%s]))`,
+		messagingProcessMetric, o.messagingSelector(), o.window(),
+	)
 	samples, err := o.client.InstantQuery(ctx, query)
 	if err != nil {
 		o.queryFailed("messaging", err)
 		return
 	}
 	for _, s := range samples {
-		service, dest := s.Metric["service"], s.Metric["messaging_destination_name"]
-		if service == "" || dest == "" {
+		dest := s.Metric["messaging_destination_name"]
+		if dest == "" {
 			continue
 		}
-		direction := messagingDirection(s.Metric["messaging_operation"])
-		src := res.resolveEndpointNode(service, s.Metric["k8s_namespace_name"])
+		src := res.resolveClient(s.Metric)
 		edges.add(model.DependencyEdge{
 			Source:  src,
 			Target:  externalNode(dest),
 			Type:    kindKafka,
 			Origin:  originMetrics,
-			Details: direction,
+			Details: "consume",
 		})
 		if src.External {
 			continue
 		}
 		if app := appByKey[src.Namespace+"/"+src.Service]; app != nil {
-			attachKafka(app, dest, direction, originMetrics)
+			attachKafka(app, dest, "consume", originMetrics)
 		}
 	}
+}
+
+// messagingSelector scopes the messaging query to Kafka — the only system Beyla
+// emits process metrics for here — and to this cluster when one is configured.
+func (o *Overlayer) messagingSelector() string {
+	if o.cluster == "" {
+		return `{messaging_system="kafka"}`
+	}
+	return fmt.Sprintf(`{messaging_system="kafka",cluster=%q}`, o.cluster)
 }
 
 func (o *Overlayer) queryFailed(name string, err error) {
@@ -550,18 +588,6 @@ func (o *Overlayer) forwardLookup(ctx context.Context, host string) []string {
 	o.hostCache[host] = ips
 	o.hostMu.Unlock()
 	return ips
-}
-
-// messagingDirection maps an OTel messaging.operation value to produce/consume.
-func messagingDirection(op string) string {
-	switch op {
-	case "receive", "process", "deliver":
-		return "consume"
-	case "publish", "send", "create":
-		return "produce"
-	default:
-		return ""
-	}
 }
 
 // --- application attachment --------------------------------------------------
