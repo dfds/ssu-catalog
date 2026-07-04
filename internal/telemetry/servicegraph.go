@@ -92,6 +92,7 @@ func (o *Overlayer) Apply(ctx context.Context, apps []model.ApplicationEntry) []
 	o.applyDatabaseMetrics(ctx, res, appByKey, edges, httpPeers)
 	o.applyMessagingMetrics(ctx, res, appByKey, edges)
 	o.applyRuntimeMetrics(ctx, res, appByKey)
+	o.applyTrafficMetrics(ctx, res, appByKey)
 
 	return edges.list
 }
@@ -526,6 +527,61 @@ func (o *Overlayer) applyRuntimeMetrics(ctx context.Context, res *resolver, appB
 		if app := appByKey[src.Namespace+"/"+src.Service]; app != nil && app.Runtime == "" {
 			app.Runtime = lang // first detected wins
 		}
+	}
+}
+
+// httpServerMetric is Beyla's inbound HTTP request counter. The `application`
+// feature emits it server-side with the workload's k8s labels and an
+// http_response_status_code label; the _count survives scrape (buckets are
+// dropped), so it yields request rate (activity) and the 5xx share (health) — but
+// no latency percentiles.
+const httpServerMetric = "http_server_request_duration_seconds_count"
+
+// applyTrafficMetrics attaches inbound HTTP throughput + error ratio to each
+// workload from Beyla's http_server_request_duration_seconds_count. Best-effort:
+// only Beyla-instrumented HTTP servers report it. Unlike the other overlays this
+// one AGGREGATES across the http_response_status_code series per workload before
+// assigning, so it accumulates into a temp map keyed by *ApplicationEntry. Uses
+// rate() (a counter, like the db/messaging overlays) and joins via resolveClient —
+// the server metric carries the same k8s workload labels. No dependency edge is
+// emitted: request rate/health is a workload attribute, not a relation.
+func (o *Overlayer) applyTrafficMetrics(ctx context.Context, res *resolver, appByKey map[string]*model.ApplicationEntry) {
+	query := fmt.Sprintf(
+		`sum by (k8s_namespace_name, k8s_deployment_name, k8s_statefulset_name, service_name, service, http_response_status_code) (rate(%s%s[%s]))`,
+		httpServerMetric, o.clusterMatcher(), o.window(),
+	)
+	samples, err := o.client.InstantQuery(ctx, query)
+	if err != nil {
+		o.queryFailed("traffic", err)
+		return
+	}
+	type acc struct{ total, errors float64 }
+	byApp := map[*model.ApplicationEntry]*acc{}
+	for _, s := range samples {
+		src := res.resolveClient(s.Metric) // server metric: k8s labels identify the owning workload
+		if src.External {
+			continue
+		}
+		app := appByKey[src.Namespace+"/"+src.Service]
+		if app == nil {
+			continue
+		}
+		a := byApp[app]
+		if a == nil {
+			a = &acc{}
+			byApp[app] = a
+		}
+		a.total += s.Value
+		if code := s.Metric["http_response_status_code"]; strings.HasPrefix(code, "5") {
+			a.errors += s.Value
+		}
+	}
+	for app, a := range byApp {
+		if a.total <= 0 {
+			continue
+		}
+		app.RequestRate = a.total
+		app.ErrorRate = a.errors / a.total
 	}
 }
 

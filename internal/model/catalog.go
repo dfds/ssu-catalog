@@ -71,6 +71,15 @@ type ApplicationEntry struct {
 	// undetected/"generic".
 	Runtime string `json:"runtime"`
 
+	// RequestRate is inbound HTTP throughput (req/s) from Beyla's
+	// http_server_request_duration_seconds_count, summed across status codes over
+	// the lookback. 0/absent when Beyla observed no inbound HTTP. ErrorRate is the
+	// 5xx share of that traffic (0..1). Both best-effort; only Beyla-instrumented
+	// HTTP servers report them, and buckets are dropped at scrape so no latency
+	// percentiles are derivable — only rate + error ratio.
+	RequestRate float64 `json:"requestRate,omitempty"`
+	ErrorRate   float64 `json:"errorRate,omitempty"`
+
 	Labels      map[string]string `json:"labels"`
 	Annotations map[string]string `json:"annotations"`
 }

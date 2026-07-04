@@ -357,6 +357,49 @@ func TestApply_RuntimeMetricsSupplement(t *testing.T) {
 	}
 }
 
+func TestApply_TrafficMetrics(t *testing.T) {
+	// Beyla's http_server_request_duration_seconds_count carries the workload's k8s
+	// labels + an http_response_status_code label; resolution joins via resolveClient.
+	// The overlay aggregates across status codes per workload: total req/s = sum of
+	// all series, error ratio = 5xx share. A workload with only 2xx traffic has a 0
+	// error ratio; a workload with no series stays absent (RequestRate 0).
+	stub := &stubClient{byQuery: map[string][]Sample{
+		"http_server_request_duration_seconds_count": {
+			// api: 9 req/s of 200 + 1 req/s of 500 → total 10, error ratio 0.1
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
+				"http_response_status_code": "200",
+			}, Value: 9},
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-a", "k8s_deployment_name": "api", "service_name": "api",
+				"http_response_status_code": "500",
+			}, Value: 1},
+			// worker: only 2xx → error ratio 0
+			{Metric: map[string]string{
+				"k8s_namespace_name": "cap-b", "k8s_deployment_name": "worker", "service_name": "worker",
+				"http_response_status_code": "204",
+			}, Value: 4},
+		},
+	}}
+	apps := sampleApps()
+	overlayerWith(stub).Apply(context.Background(), apps)
+
+	api := findApp(apps, "api")
+	if api.RequestRate != 10 {
+		t.Errorf("expected api RequestRate 10, got %v", api.RequestRate)
+	}
+	if api.ErrorRate != 0.1 {
+		t.Errorf("expected api ErrorRate 0.1, got %v", api.ErrorRate)
+	}
+	worker := findApp(apps, "worker")
+	if worker.RequestRate != 4 {
+		t.Errorf("expected worker RequestRate 4, got %v", worker.RequestRate)
+	}
+	if worker.ErrorRate != 0 {
+		t.Errorf("expected worker ErrorRate 0, got %v", worker.ErrorRate)
+	}
+}
+
 func TestApply_QueryFailureDegradesGracefully(t *testing.T) {
 	stub := &stubClient{
 		errFor: map[string]bool{"traces_service_graph_request_total": true},
