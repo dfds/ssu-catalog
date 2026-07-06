@@ -29,6 +29,9 @@ const (
 // maxProbeBodyBytes caps how much of a probe response we read for validation.
 const maxProbeBodyBytes = 2 << 20 // 2 MiB
 
+// userAgent identifies this service on every outbound HTTP request.
+const userAgent = "ssu-catalog - https://github.com/dfds/ssu-catalog"
+
 // defaultPaths are the well-known documentation locations probed on each port.
 var defaultPaths = []string{
 	"/swagger",
@@ -181,6 +184,7 @@ func (p *Prober) probeOne(ctx context.Context, j job) (model.APIDocInfo, bool) {
 	if err != nil {
 		return model.APIDocInfo{}, false
 	}
+	req.Header.Set("User-Agent", userAgent)
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return model.APIDocInfo{}, false

@@ -11,6 +11,9 @@ import (
 	"time"
 )
 
+// userAgent identifies this service on every outbound HTTP request.
+const userAgent = "ssu-catalog - https://github.com/dfds/ssu-catalog"
+
 // Client is a thin Grafana Cloud Mimir (Prometheus-compatible) HTTP client that
 // issues instant queries with optional basic auth.
 type Client struct {
@@ -40,6 +43,7 @@ func (c *Client) InstantQuery(ctx context.Context, query string) ([]Sample, erro
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", userAgent)
 	if c.user != "" {
 		req.SetBasicAuth(c.user, c.token)
 	}
