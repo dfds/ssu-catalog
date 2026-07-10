@@ -35,6 +35,10 @@ All configuration comes from the environment with the **`SSUC_`** prefix (via
 | `SSUC_SWAGGER_ENABLED` | No | `true` | OpenAPI/Swagger detection |
 | `SSUC_SWAGGER_TIMEOUTMS` | No | `2000` | Per-probe HTTP timeout (ms) |
 | `SSUC_SWAGGER_CONCURRENCY` | No | `20` | Max concurrent probes |
+| `SSUC_REACHABILITY_ENABLED` | No | `true` | Active ingress-reachability probing (separate worker + interval) |
+| `SSUC_REACHABILITY_INTERVAL` | No | `300` | Reachability probe interval (seconds), decoupled from collection |
+| `SSUC_REACHABILITY_TIMEOUTMS` | No | `5000` | Per-attempt HTTP timeout (ms) |
+| `SSUC_REACHABILITY_CONCURRENCY` | No | `20` | Max concurrent reachability probes |
 | `SSUC_TELEMETRY_ENABLED` | No | `false` | Service-graph dependency overlay |
 | `SSUC_TELEMETRY_MIMIRURL` | If telemetry on | — | Grafana Cloud Mimir base URL (e.g. `https://<stack>.grafana.net/api/prom`) |
 | `SSUC_TELEMETRY_BASICAUTHUSER` | No | — | Grafana Cloud user / instance ID |
@@ -64,6 +68,15 @@ Base path `/api/v1`; JSON. All `/api/v1/*` routes require a valid Bearer token w
 | `GET` | `/api/v1/namespaces/:namespace` | Namespace detail + its applications |
 | `GET` | `/api/v1/dependencies` | Dependency overlay (`?namespace=&type=` filters) |
 | `GET` | `/api/v1/dependencies/:namespace/:name` | Inbound + outbound edges for one application |
+| `GET` | `/api/v1/reachability` | Ingress-reachability verdicts straight from the store (list of `ReachabilityResult`) |
+
+The applications/catalog endpoints **overlay** reachability onto each `service.reachability`
+(per exposed host: `status` = `reachable`/`unreachable`/`unknown`, `statusCode`, `expected`,
+`reason`, `checkedAt`). Reachability is produced by a separate worker on its own interval and is
+absent from the collected snapshot — opted-out and not-yet-probed hosts have no entry (render as
+`unknown`, neutral). Per-host probe config comes from the exposing ingress's annotations:
+`dfds.cloud/reachability-probe=false` (skip), `-path`, `-method` (default `GET`), `-expect`
+(single `204` / range `200-299` / class `2xx` / comma-list; default `200`).
 
 Every response uses the envelope below; each entry already carries `cluster`, so a merged
 multi-cluster response from `selfservice-api` stays unambiguous:
@@ -90,6 +103,11 @@ Exposed on `:9090/metrics`. Every series carries a `cluster_name` const label.
 | `ssu_catalog_scrape_errors_total` | counter | Failed collection cycles |
 | `ssu_catalog_swagger_probes_total` | counter | OpenAPI/Swagger probe requests issued |
 | `ssu_catalog_swagger_hits_total` | counter | OpenAPI/Swagger probe hits |
+| `ssu_catalog_reachability_probes_total` | counter | Ingress reachability probes issued |
+| `ssu_catalog_reachability_reachable_total` | counter | Reachability verdicts: reachable |
+| `ssu_catalog_reachability_unreachable_total` | counter | Reachability verdicts: unreachable |
+| `ssu_catalog_reachability_unknown_total` | counter | Reachability verdicts: unknown (transport error) |
+| `ssu_catalog_reachability_duration_seconds` | histogram | Duration of a reachability probe cycle |
 | `ssu_catalog_telemetry_query_errors_total` | counter | Failed telemetry (Mimir) queries |
 | `ssu_catalog_auth_rejections_total` | counter | Rejected inbound API requests |
 
@@ -108,11 +126,13 @@ environment. With a valid `KUBECONFIG`:
 ```bash
 SSUC_CLUSTERNAME=local SSUC_LOGDEBUG=true SSUC_WORKERINTERVAL=30 \
 SSUC_OIDC_ENABLED=false SSUC_SWAGGER_ENABLED=true SSUC_TELEMETRY_ENABLED=false \
+SSUC_REACHABILITY_ENABLED=true SSUC_REACHABILITY_INTERVAL=30 \
 make run
 
 curl -s http://localhost:8080/api/v1/catalog/stats | jq .
 curl -s 'http://localhost:8080/api/v1/applications?capabilityId=' | jq '.data[].deploymentSource'
 curl -s http://localhost:8080/api/v1/dependencies | jq .
+curl -s http://localhost:8080/api/v1/reachability | jq '.data'
 curl -s http://localhost:9090/metrics | grep ssu_catalog_
 ```
 
@@ -152,3 +172,10 @@ One collection cycle (`internal/collector/collector.go`):
    degrading gracefully on query failure.
 6. **Add NetworkPolicy egress** as declared (`network_policy`) dependency edges.
 7. **Compute stats** and atomically swap in the new snapshot, served live by the API.
+
+A **separate reachability worker** (`internal/reachability/`) runs on its own interval, decoupled
+from the cycle above. Each tick it reads the live catalog snapshot read-only, probes the external
+ingress hosts each workload is exposed at (one probe per distinct host, at the shortest known route
+prefix; follows redirects, verifies TLS, retries transient failures), and atomically swaps a fresh
+verdict store keyed `namespace/service/host`. The API overlays that store onto `service.reachability`
+at serve time — a full rebuild each tick makes it self-pruning.

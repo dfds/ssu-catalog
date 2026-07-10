@@ -62,7 +62,7 @@ func NewMetrics(clusterName string) *Metrics {
 			Buckets:     prometheus.DefBuckets,
 			ConstLabels: constLabels,
 		}),
-		ScrapeErrors:         counter("ssu_catalog_scrape_errors_total", "Total failed collection cycles"),
+		ScrapeErrors:            counter("ssu_catalog_scrape_errors_total", "Total failed collection cycles"),
 		SwaggerProbes:           counter("ssu_catalog_swagger_probes_total", "Total OpenAPI/Swagger probe requests issued"),
 		SwaggerHits:             counter("ssu_catalog_swagger_hits_total", "Total OpenAPI/Swagger probe hits"),
 		ReachabilityProbes:      counter("ssu_catalog_reachability_probes_total", "Total ingress reachability probes issued"),

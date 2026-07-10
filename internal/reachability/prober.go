@@ -18,8 +18,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/sync/errgroup"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"go.dfds.cloud/ssu-catalog/internal/model"
 )
