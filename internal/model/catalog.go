@@ -91,18 +91,38 @@ type ServiceRef struct {
 	ClusterIP     string        `json:"clusterIP"`
 	Ports         []ServicePort `json:"ports"`
 	ExternalHosts []string      `json:"externalHosts"` // from Ingress + Traefik IngressRoute rules
-	Routes        []RouteRef    `json:"routes"`        // Traefik IngressRoute detail (name/paths/entrypoints/TLS)
+	Routes        []RouteRef    `json:"routes"`        // Ingress + Traefik IngressRoute detail (name/paths/entrypoints/TLS)
 	APIDocs       []APIDocInfo  `json:"apiDocs"`       // every hit (no short-circuit)
+
+	// Reachability is the active ingress-reachability verdict per exposed host.
+	// Populated at serve time by overlaying the separate reachability store — it
+	// is NOT written during collection and is absent from the collected snapshot.
+	Reachability []ReachabilityResult `json:"reachability,omitempty"`
 }
 
-// RouteRef is a Traefik IngressRoute that routes external traffic to a Service.
+// RouteRef is an Ingress or Traefik IngressRoute that routes external traffic to
+// a Service.
 type RouteRef struct {
-	Name         string   `json:"name"`         // IngressRoute metadata.name
-	Kind         string   `json:"kind"`         // "IngressRoute"
-	Hosts        []string `json:"hosts"`        // literal Host(`…`) matchers
-	PathPrefixes []string `json:"pathPrefixes"` // literal PathPrefix(`…`) / Path(`…`) matchers
-	EntryPoints  []string `json:"entryPoints"`  // spec.entryPoints
-	TLS          bool     `json:"tls"`          // spec.tls present
+	Name         string            `json:"name"`         // Ingress / IngressRoute metadata.name
+	Kind         string            `json:"kind"`         // "Ingress" | "IngressRoute"
+	Hosts        []string          `json:"hosts"`        // literal Host(`…`) matchers / Ingress rule hosts
+	PathPrefixes []string          `json:"pathPrefixes"` // literal PathPrefix(`…`) / Path(`…`) matchers / Ingress paths
+	EntryPoints  []string          `json:"entryPoints"`  // spec.entryPoints (IngressRoute only)
+	TLS          bool              `json:"tls"`          // spec.tls present (IngressRoute only)
+	Annotations  map[string]string `json:"annotations"`  // owning object's annotations (reachability probe config)
+}
+
+// ReachabilityResult is the verdict of one active reachability probe against a
+// single exposed host. Produced by the reachability worker and stored separately
+// from the catalog; overlaid onto ServiceRef.Reachability at serve time.
+type ReachabilityResult struct {
+	Host       string    `json:"host"`
+	URL        string    `json:"url"`        // probed external URL (scheme://host/path)
+	Status     string    `json:"status"`     // "reachable" | "unreachable" | "unknown"
+	StatusCode int       `json:"statusCode"` // final code after redirects; 0 on transport error
+	Expected   string    `json:"expected"`   // resolved expectation, e.g. "200" / "200-299"
+	Reason     string    `json:"reason"`     // short error/description when not reachable
+	CheckedAt  time.Time `json:"checkedAt"`
 }
 
 // AppMetadata is author-declared catalog metadata read from dfds.cloud/*

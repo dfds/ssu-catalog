@@ -7,17 +7,64 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"go.dfds.cloud/ssu-catalog/internal/model"
+	"go.dfds.cloud/ssu-catalog/internal/reachability"
 )
 
 // Catalog serves the in-memory snapshot. All reads are lock-free via the atomic
-// pointer; the worker swaps in a fresh *Catalog each cycle.
+// pointer; the worker swaps in a fresh *Catalog each cycle. Reachability verdicts
+// live in a separate store and are overlaid onto served applications at read time.
 type Catalog struct {
 	catalog *atomic.Pointer[model.Catalog]
+	reach   *reachability.Store
 	cluster string
 }
 
-func NewCatalog(catalog *atomic.Pointer[model.Catalog], cluster string) *Catalog {
-	return &Catalog{catalog: catalog, cluster: cluster}
+func NewCatalog(catalog *atomic.Pointer[model.Catalog], reach *reachability.Store, cluster string) *Catalog {
+	return &Catalog{catalog: catalog, reach: reach, cluster: cluster}
+}
+
+// overlayApp returns a shallow copy of app with each ServiceRef's Reachability
+// filled from the store, keyed by "namespace/service/host". It never mutates the
+// shared catalog snapshot — the Services slice and the affected ServiceRef values
+// are copied before Reachability is set. Apps with no matching verdicts are
+// returned unchanged.
+func (h *Catalog) overlayApp(app model.ApplicationEntry) model.ApplicationEntry {
+	if h.reach == nil || len(app.Services) == 0 {
+		return app
+	}
+	var services []model.ServiceRef
+	changed := false
+	for i, svc := range app.Services {
+		var results []model.ReachabilityResult
+		for _, host := range svc.ExternalHosts {
+			if r, ok := h.reach.Lookup(app.Namespace + "/" + svc.Name + "/" + host); ok {
+				results = append(results, r)
+			}
+		}
+		if len(results) == 0 {
+			continue
+		}
+		if !changed {
+			services = make([]model.ServiceRef, len(app.Services))
+			copy(services, app.Services)
+			changed = true
+		}
+		services[i].Reachability = results
+	}
+	if !changed {
+		return app
+	}
+	app.Services = services
+	return app
+}
+
+// overlayApps maps overlayApp over a slice, returning a new slice.
+func (h *Catalog) overlayApps(apps []model.ApplicationEntry) []model.ApplicationEntry {
+	out := make([]model.ApplicationEntry, len(apps))
+	for i, app := range apps {
+		out[i] = h.overlayApp(app)
+	}
+	return out
 }
 
 func (h *Catalog) snapshot() *model.Catalog {
@@ -35,10 +82,13 @@ func (h *Catalog) respond(c *gin.Context, cat *model.Catalog, data any) {
 	c.JSON(http.StatusOK, gin.H{"data": data, "meta": h.meta(cat)})
 }
 
-// GetCatalog returns the full snapshot.
+// GetCatalog returns the full snapshot with reachability overlaid onto its
+// applications. cat is shallow-copied so the shared snapshot is never mutated.
 func (h *Catalog) GetCatalog(c *gin.Context) {
 	cat := h.snapshot()
-	c.JSON(http.StatusOK, gin.H{"data": cat, "meta": h.meta(cat)})
+	view := *cat
+	view.Applications = h.overlayApps(cat.Applications)
+	c.JSON(http.StatusOK, gin.H{"data": &view, "meta": h.meta(cat)})
 }
 
 // GetStats returns just the stats block.
@@ -77,7 +127,7 @@ func (h *Catalog) ListApplications(c *gin.Context) {
 		if hasDocsFilter && applicationHasDocs(app) != hasDocsWant {
 			continue
 		}
-		out = append(out, app)
+		out = append(out, h.overlayApp(app))
 	}
 
 	h.respond(c, cat, out)
@@ -91,7 +141,7 @@ func (h *Catalog) GetApplication(c *gin.Context) {
 
 	for _, app := range cat.Applications {
 		if app.Namespace == namespace && app.Name == name {
-			h.respond(c, cat, app)
+			h.respond(c, cat, h.overlayApp(app))
 			return
 		}
 	}
@@ -133,7 +183,7 @@ func (h *Catalog) GetNamespace(c *gin.Context) {
 	apps := make([]model.ApplicationEntry, 0)
 	for _, app := range cat.Applications {
 		if app.Namespace == name {
-			apps = append(apps, app)
+			apps = append(apps, h.overlayApp(app))
 		}
 	}
 	h.respond(c, cat, gin.H{"namespace": found, "applications": apps})
@@ -175,6 +225,20 @@ func (h *Catalog) GetApplicationDependencies(c *gin.Context) {
 		}
 	}
 	h.respond(c, cat, gin.H{"inbound": inbound, "outbound": outbound})
+}
+
+// ListReachability returns the full reachability store — every current verdict,
+// keyed store flattened to a sorted list — for consumers that want the verdicts
+// directly rather than overlaid onto applications.
+func (h *Catalog) ListReachability(c *gin.Context) {
+	cat := h.snapshot()
+	var results []model.ReachabilityResult
+	if h.reach != nil {
+		results = h.reach.All()
+	} else {
+		results = []model.ReachabilityResult{}
+	}
+	h.respond(c, cat, results)
 }
 
 func applicationHasDocs(app model.ApplicationEntry) bool {

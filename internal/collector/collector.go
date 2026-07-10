@@ -125,8 +125,12 @@ func (c *Collector) buildApplications(
 	capabilityByNamespace map[string]string,
 	resolver *gitops.Resolver,
 ) []model.ApplicationEntry {
-	// Index ingress external hosts by (namespace, service).
+	// Index ingress external hosts and route detail by (namespace, service). Hosts
+	// feed ServiceRef.ExternalHosts; standard-Ingress rules are also synthesized
+	// into RouteRef{Kind:"Ingress"} entries so the per-route detail (host, path,
+	// annotations) is available to swagger + reachability, alongside IngressRoutes.
 	hostsByService := make(map[string][]string)
+	routesByService := make(map[string][]model.RouteRef)
 	for _, ing := range snapshot.Ingresses {
 		for svc, hosts := range ing.ServiceHosts {
 			key := ing.Namespace + "/" + svc
@@ -134,12 +138,27 @@ func (c *Collector) buildApplications(
 				hostsByService[key] = appendUnique(hostsByService[key], h)
 			}
 		}
+		for svc, paths := range ing.ServiceRoutes {
+			key := ing.Namespace + "/" + svc
+			for _, p := range paths {
+				var prefixes []string
+				if p.Path != "" {
+					prefixes = []string{p.Path}
+				}
+				routesByService[key] = appendRouteUnique(routesByService[key], model.RouteRef{
+					Name:         ing.Name,
+					Kind:         "Ingress",
+					Hosts:        []string{p.Host},
+					PathPrefixes: prefixes,
+					Annotations:  ing.Annotations,
+				})
+			}
+		}
 	}
 
 	// Index Traefik IngressRoute hosts and route detail by (namespace, service).
 	// Hosts merge into the same ExternalHosts surface as Ingress; the richer
 	// per-route detail is attached separately as ServiceRef.Routes.
-	routesByService := make(map[string][]model.RouteRef)
 	for _, ir := range snapshot.IngressRoutes {
 		for _, rule := range ir.Routes {
 			for _, svc := range rule.Services {
@@ -154,6 +173,7 @@ func (c *Collector) buildApplications(
 					PathPrefixes: rule.PathPrefixes,
 					EntryPoints:  ir.EntryPoints,
 					TLS:          ir.TLS,
+					Annotations:  ir.Annotations,
 				})
 			}
 		}

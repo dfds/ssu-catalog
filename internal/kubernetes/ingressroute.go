@@ -16,8 +16,9 @@ import (
 type IngressRouteInfo struct {
 	Namespace   string
 	Name        string
-	EntryPoints []string // spec.entryPoints (spec-level, applies to every route)
-	TLS         bool     // spec.tls present
+	EntryPoints []string          // spec.entryPoints (spec-level, applies to every route)
+	TLS         bool              // spec.tls present
+	Annotations map[string]string // metadata.annotations (reachability probe config)
 	Routes      []IngressRouteRule
 }
 
@@ -71,8 +72,9 @@ func (c *Client) listIngressRoutes(ctx context.Context) []IngressRouteInfo {
 func ingressRouteInfoFrom(obj map[string]interface{}) IngressRouteInfo {
 	u := unstructured.Unstructured{Object: obj}
 	info := IngressRouteInfo{
-		Namespace: u.GetNamespace(),
-		Name:      u.GetName(),
+		Namespace:   u.GetNamespace(),
+		Name:        u.GetName(),
+		Annotations: u.GetAnnotations(),
 	}
 
 	entryPoints, _, _ := unstructured.NestedStringSlice(obj, "spec", "entryPoints")

@@ -59,6 +59,15 @@ type Config struct {
 		Concurrency int  `json:"concurrency"`
 	} `json:"swagger"`
 
+	// Reachability configures the active ingress-reachability prober, which runs
+	// on its own goroutine and interval, decoupled from the collection cycle.
+	Reachability struct {
+		Enabled     bool `json:"enabled"`
+		Interval    int  `json:"interval"`    // seconds between probe cycles
+		TimeoutMs   int  `json:"timeoutMs"`   // per-attempt timeout
+		Concurrency int  `json:"concurrency"` // bounded probe concurrency
+	} `json:"reachability"`
+
 	Telemetry struct {
 		Enabled         bool   `json:"enabled"`
 		MimirURL        string `json:"mimirUrl"`
@@ -85,6 +94,7 @@ func Load() (Config, error) {
 	conf.OIDC.Enabled = true
 	conf.GitOps.Enabled = true
 	conf.Swagger.Enabled = true
+	conf.Reachability.Enabled = true
 
 	if err := envconfig.Process(appConfPrefix, &conf); err != nil {
 		return conf, err
@@ -124,6 +134,15 @@ func Load() (Config, error) {
 	}
 	if conf.Swagger.Concurrency == 0 {
 		conf.Swagger.Concurrency = 20
+	}
+	if conf.Reachability.Interval == 0 {
+		conf.Reachability.Interval = 300
+	}
+	if conf.Reachability.TimeoutMs == 0 {
+		conf.Reachability.TimeoutMs = 5000
+	}
+	if conf.Reachability.Concurrency == 0 {
+		conf.Reachability.Concurrency = 20
 	}
 	if conf.Telemetry.LookbackMinutes == 0 {
 		conf.Telemetry.LookbackMinutes = 60

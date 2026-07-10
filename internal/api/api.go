@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.dfds.cloud/ssu-catalog/internal/api/handlers"
 	"go.dfds.cloud/ssu-catalog/internal/model"
+	"go.dfds.cloud/ssu-catalog/internal/reachability"
 )
 
 // Configure registers all routes on the given router. The /api/v1 group is
@@ -14,6 +15,7 @@ import (
 func Configure(
 	router *gin.Engine,
 	catalogPtr *atomic.Pointer[model.Catalog],
+	reachStore *reachability.Store,
 	cluster string,
 	authMW gin.HandlerFunc,
 ) {
@@ -21,7 +23,7 @@ func Configure(
 	router.GET("/healthz", health.Healthz)
 	router.GET("/readyz", health.Readyz)
 
-	cat := handlers.NewCatalog(catalogPtr, cluster)
+	cat := handlers.NewCatalog(catalogPtr, reachStore, cluster)
 
 	v1 := router.Group("/api/v1")
 	if authMW != nil {
@@ -36,4 +38,5 @@ func Configure(
 	v1.GET("/namespaces/:namespace", cat.GetNamespace)
 	v1.GET("/dependencies", cat.ListDependencies)
 	v1.GET("/dependencies/:namespace/:name", cat.GetApplicationDependencies)
+	v1.GET("/reachability", cat.ListReachability)
 }

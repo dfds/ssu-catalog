@@ -20,6 +20,12 @@ type Metrics struct {
 	SwaggerProbes prometheus.Counter
 	SwaggerHits   prometheus.Counter
 
+	ReachabilityProbes      prometheus.Counter
+	ReachabilityReachable   prometheus.Counter
+	ReachabilityUnreachable prometheus.Counter
+	ReachabilityUnknown     prometheus.Counter
+	ReachabilityDuration    prometheus.Histogram
+
 	TelemetryQueryErrors prometheus.Counter
 	AuthRejections       prometheus.Counter
 }
@@ -57,8 +63,18 @@ func NewMetrics(clusterName string) *Metrics {
 			ConstLabels: constLabels,
 		}),
 		ScrapeErrors:         counter("ssu_catalog_scrape_errors_total", "Total failed collection cycles"),
-		SwaggerProbes:        counter("ssu_catalog_swagger_probes_total", "Total OpenAPI/Swagger probe requests issued"),
-		SwaggerHits:          counter("ssu_catalog_swagger_hits_total", "Total OpenAPI/Swagger probe hits"),
+		SwaggerProbes:           counter("ssu_catalog_swagger_probes_total", "Total OpenAPI/Swagger probe requests issued"),
+		SwaggerHits:             counter("ssu_catalog_swagger_hits_total", "Total OpenAPI/Swagger probe hits"),
+		ReachabilityProbes:      counter("ssu_catalog_reachability_probes_total", "Total ingress reachability probes issued"),
+		ReachabilityReachable:   counter("ssu_catalog_reachability_reachable_total", "Total reachability verdicts: reachable"),
+		ReachabilityUnreachable: counter("ssu_catalog_reachability_unreachable_total", "Total reachability verdicts: unreachable"),
+		ReachabilityUnknown:     counter("ssu_catalog_reachability_unknown_total", "Total reachability verdicts: unknown (transport error)"),
+		ReachabilityDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+			Name:        "ssu_catalog_reachability_duration_seconds",
+			Help:        "Duration of a reachability probe cycle",
+			Buckets:     prometheus.DefBuckets,
+			ConstLabels: constLabels,
+		}),
 		TelemetryQueryErrors: counter("ssu_catalog_telemetry_query_errors_total", "Total failed telemetry (Mimir) queries"),
 		AuthRejections:       counter("ssu_catalog_auth_rejections_total", "Total rejected inbound API requests"),
 	}

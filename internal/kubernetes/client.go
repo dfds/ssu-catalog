@@ -103,6 +103,19 @@ type IngressInfo struct {
 	Name      string
 	// ServiceHosts maps a backing service name to the external hostnames routed to it.
 	ServiceHosts map[string][]string
+	// ServiceRoutes maps a backing service name to the (host, path) pairs routing
+	// to it, capturing the standard-Ingress path so reachability probing can target
+	// the shortest known route prefix per host.
+	ServiceRoutes map[string][]IngressPath
+	// Annotations are the Ingress object's metadata.annotations, used to resolve
+	// reachability probe config for the routes it owns.
+	Annotations map[string]string
+}
+
+// IngressPath is one (host, path) pair from a standard Ingress rule.
+type IngressPath struct {
+	Host string
+	Path string
 }
 
 type NetworkPolicyInfo struct {
@@ -536,6 +549,7 @@ func selectorMatchLabels(sel *metav1.LabelSelector) map[string]string {
 
 func ingressInfoFrom(ing *networkingv1.Ingress) IngressInfo {
 	serviceHosts := make(map[string][]string)
+	serviceRoutes := make(map[string][]IngressPath)
 	for _, rule := range ing.Spec.Rules {
 		host := rule.Host
 		if host == "" || rule.HTTP == nil {
@@ -547,13 +561,27 @@ func ingressInfoFrom(ing *networkingv1.Ingress) IngressInfo {
 			}
 			svc := path.Backend.Service.Name
 			serviceHosts[svc] = appendUnique(serviceHosts[svc], host)
+			serviceRoutes[svc] = appendIngressPathUnique(serviceRoutes[svc], IngressPath{Host: host, Path: path.Path})
 		}
 	}
 	return IngressInfo{
-		Namespace:    ing.Namespace,
-		Name:         ing.Name,
-		ServiceHosts: serviceHosts,
+		Namespace:     ing.Namespace,
+		Name:          ing.Name,
+		ServiceHosts:  serviceHosts,
+		ServiceRoutes: serviceRoutes,
+		Annotations:   ing.Annotations,
 	}
+}
+
+// appendIngressPathUnique appends p unless an identical (host, path) pair is
+// already present.
+func appendIngressPathUnique(paths []IngressPath, p IngressPath) []IngressPath {
+	for _, existing := range paths {
+		if existing == p {
+			return paths
+		}
+	}
+	return append(paths, p)
 }
 
 func networkPolicyInfoFrom(np *networkingv1.NetworkPolicy) NetworkPolicyInfo {

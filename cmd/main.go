@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync/atomic"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"go.dfds.cloud/ssu-catalog/internal/kubernetes"
 	"go.dfds.cloud/ssu-catalog/internal/metrics"
 	"go.dfds.cloud/ssu-catalog/internal/model"
+	"go.dfds.cloud/ssu-catalog/internal/reachability"
 	"go.dfds.cloud/ssu-catalog/internal/swagger"
 	"go.dfds.cloud/ssu-catalog/internal/telemetry"
 	"go.uber.org/zap"
@@ -41,6 +43,10 @@ func main() {
 	// Live catalog snapshot, swapped atomically by the worker each cycle.
 	catalogPtr := &atomic.Pointer[model.Catalog]{}
 
+	// Reachability verdicts, produced by a separate worker on its own interval and
+	// overlaid onto the catalog at serve time.
+	reachStore := reachability.NewStore()
+
 	// OIDC middleware (or pass-through for local dev).
 	authMW := auth.DisabledMiddleware()
 	if conf.OIDC.Enabled {
@@ -54,9 +60,14 @@ func main() {
 		log.Warn("OIDC validation is DISABLED — local dev only")
 	}
 
-	api.Configure(manager.HttpRouter, catalogPtr, conf.ClusterName, authMW)
+	api.Configure(manager.HttpRouter, catalogPtr, reachStore, conf.ClusterName, authMW)
 
 	go worker(manager.Context, conf, m, catalogPtr, log)
+	if conf.Reachability.Enabled {
+		go reachabilityWorker(manager.Context, conf, m, catalogPtr, reachStore, log)
+	} else {
+		log.Info("ingress reachability probing is disabled")
+	}
 
 	<-manager.Context.Done()
 	if err := manager.HttpServer.Shutdown(context.Background()); err != nil {
@@ -147,6 +158,52 @@ func worker(
 		case <-ctx.Done():
 			return
 		case <-time.After(interval):
+		}
+	}
+}
+
+// reachabilityWorker probes exposed ingress hosts on its own cadence, decoupled
+// from the collection cycle. It reads the live catalog snapshot read-only and
+// writes fresh verdicts into the store each tick (full rebuild → self-pruning).
+// It skips cleanly until the first catalog exists.
+func reachabilityWorker(
+	ctx context.Context,
+	conf config.Config,
+	m *metrics.Metrics,
+	catalogPtr *atomic.Pointer[model.Catalog],
+	store *reachability.Store,
+	log *zap.Logger,
+) {
+	prober := reachability.NewProber(
+		time.Duration(conf.Reachability.TimeoutMs)*time.Millisecond,
+		conf.Reachability.Concurrency,
+		log,
+		reachability.Counters{
+			Probes:      m.ReachabilityProbes,
+			Reachable:   m.ReachabilityReachable,
+			Unreachable: m.ReachabilityUnreachable,
+			Unknown:     m.ReachabilityUnknown,
+			Duration:    m.ReachabilityDuration,
+		},
+	)
+	interval := time.Duration(conf.Reachability.Interval) * time.Second
+
+	for {
+		if cat := catalogPtr.Load(); cat != nil {
+			results := prober.Probe(ctx, cat)
+			store.Store(results)
+			log.Info("reachability probing complete", zap.Int("hosts", len(results)))
+		} else {
+			log.Debug("reachability probing skipped: no catalog yet")
+		}
+
+		// Jitter (up to 10% of the interval) spreads probe cycles so multiple
+		// instances don't hammer shared ingress hosts in lockstep.
+		jitter := time.Duration(rand.Int63n(int64(interval)/10 + 1))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval + jitter):
 		}
 	}
 }
